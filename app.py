@@ -16,7 +16,7 @@ import logging
 from typing import Optional, Dict, List, Tuple
 from collections import deque
 from flask import Flask, render_template, jsonify, request
-from lifx_client import LifxLanClient, LifxLight
+from lifx_client import DEFAULT_BATCH_EXECUTOR_WORKERS, LifxLanClient, LifxLight
 from dmx_receiver import DMXReceiver
 
 # Set up logging for DMX to LIFX traffic (controlled via environment variables)
@@ -25,6 +25,7 @@ from dmx_receiver import DMXReceiver
 # PERF_LOG_SAMPLE_RATE: Log every N frames when sampling (default: 100)
 # PERF_SEND_THRESHOLD_MS: Log sends slower than this (default: 5ms)
 # PERF_PROCESS_THRESHOLD_MS: Log processing slower than this (default: 10ms)
+# RGBW_WHITE_BLEND_COEFF: When mixing the W channel into R/G/B for RGBW DMX modes, fraction of W added to each (0–1, default 0.3)
 
 enable_dmx_log = os.getenv('ENABLE_DMX_LOG', 'false').lower() in ('true', '1', 'yes')
 enable_perf_logging = os.getenv('ENABLE_PERF_LOGGING', 'false').lower() in ('true', '1', 'yes')
@@ -50,6 +51,12 @@ except ValueError as e:
     PERF_LOG_SAMPLE_RATE = 100
     PERF_SEND_THRESHOLD_MS = 5.0
     PERF_PROCESS_THRESHOLD_MS = 10.0
+
+try:
+    BLEND_WHITE_COEFF = max(0.0, min(1.0, float(os.getenv("RGBW_WHITE_BLEND_COEFF", "0.3"))))
+except ValueError:
+    print("Warning: Invalid RGBW_WHITE_BLEND_COEFF; using default 0.3")
+    BLEND_WHITE_COEFF = 0.3
 
 # Frame counter for sampling (thread-local would be better, but simple counter works for single-threaded DMX processing)
 _dmx_frame_counter = 0
@@ -573,9 +580,9 @@ def process_dmx_data(dmx_data: list, universe: int):
             
             # For RGBW, blend white with RGB
             # Simple approach: mix white into RGB based on white channel
-            r = min(1.0, r + w * 0.3)
-            g = min(1.0, g + w * 0.3)
-            b = min(1.0, b + w * 0.3)
+            r = min(1.0, r + w * BLEND_WHITE_COEFF)
+            g = min(1.0, g + w * BLEND_WHITE_COEFF)
+            b = min(1.0, b + w * BLEND_WHITE_COEFF)
             
             # Apply brightness multiplier from mapping
             bright_adj = brightness
@@ -605,9 +612,9 @@ def process_dmx_data(dmx_data: list, universe: int):
             
             # For RGBW, blend white with RGB
             # Simple approach: mix white into RGB based on white channel
-            r = min(1.0, r + w * 0.3)
-            g = min(1.0, g + w * 0.3)
-            b = min(1.0, b + w * 0.3)
+            r = min(1.0, r + w * BLEND_WHITE_COEFF)
+            g = min(1.0, g + w * BLEND_WHITE_COEFF)
+            b = min(1.0, b + w * BLEND_WHITE_COEFF)
             
             # Apply brightness multiplier from mapping
             bright_adj = brightness
@@ -628,9 +635,9 @@ def process_dmx_data(dmx_data: list, universe: int):
             g = max(0.0, min(1.0, g_16bit / 65535.0))
             b = max(0.0, min(1.0, b_16bit / 65535.0))
             w = max(0.0, min(1.0, w_16bit / 65535.0))
-            r = min(1.0, r + w * 0.3)
-            g = min(1.0, g + w * 0.3)
-            b = min(1.0, b + w * 0.3)
+            r = min(1.0, r + w * BLEND_WHITE_COEFF)
+            g = min(1.0, g + w * BLEND_WHITE_COEFF)
+            b = min(1.0, b + w * BLEND_WHITE_COEFF)
             bright_adj = brightness
             cmd_data = (r, g, b, DEFAULT_KELVIN, FADE_DURATION_MS, bright_adj)
         
@@ -879,7 +886,7 @@ def list_lights():
         for light in lights_list:
             discovered_by_id[light_id(light)] = light
         with lifx_client.lock:
-            for target, light in lifx_client.lights.items():
+            for _target, light in lifx_client.lights.items():
                 lid = light_id(light)
                 if lid not in discovered_by_id and lid in light_mappings:
                     discovered_by_id[lid] = light
@@ -1022,7 +1029,11 @@ def apply_interfaces():
     # Recreate LIFX client with new interface if it exists
     if lifx_client:
         lifx_client.close()
-        lifx_client = LifxLanClient(bind_ip=lifx_bind_ip)
+        try:
+            lifx_client = LifxLanClient(bind_ip=lifx_bind_ip)
+        except OSError as e:
+            lifx_client = None
+            return jsonify({"success": False, "error": str(e)}), 500
     
     # Recreate DMX receiver with new interface if it exists
     if dmx_receiver:
@@ -1043,19 +1054,17 @@ def discover_lights():
     lifx_bind_ip = _normalize_interface_ip(lifx_interface)
     
     if not lifx_client:
-        lifx_client = LifxLanClient(bind_ip=lifx_bind_ip)
-    else:
-        # Check if we need to recreate with new interface
         try:
-            current_bind = lifx_client.sock.getsockname()[0]
-            if current_bind != lifx_bind_ip and lifx_bind_ip != '0.0.0.0':
-                # Interface changed, recreate client
-                lifx_client.close()
-                lifx_client = LifxLanClient(bind_ip=lifx_bind_ip)
-        except Exception as e:
-            # Socket might be closed, recreate
-            print(f"Warning: Error checking LIFX client socket, recreating client: {e}")
             lifx_client = LifxLanClient(bind_ip=lifx_bind_ip)
+        except OSError as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+    elif getattr(lifx_client, "requested_bind_ip", None) != lifx_bind_ip:
+        try:
+            lifx_client.close()
+            lifx_client = LifxLanClient(bind_ip=lifx_bind_ip)
+        except OSError as e:
+            lifx_client = None
+            return jsonify({"success": False, "error": str(e)}), 500
     
     try:
         lights = lifx_client.discover_lights(timeout=5.0)
@@ -1570,7 +1579,11 @@ def get_metrics():
         'batch_config': {
             'batch_size': BATCH_SIZE,
             'batch_interval_ms': BATCH_INTERVAL * 1000,
-            'max_workers': lifx_client.executor._max_workers if lifx_client and hasattr(lifx_client, 'executor') else 3
+            'max_workers': (
+                lifx_client.executor_max_workers
+                if lifx_client is not None
+                else DEFAULT_BATCH_EXECUTOR_WORKERS
+            )
         }
     })
 
@@ -1585,7 +1598,11 @@ def auto_discover_configured_lights():
     # Initialize LIFX client if needed
     if not lifx_client:
         lifx_bind_ip = _normalize_interface_ip(lifx_interface)
-        lifx_client = LifxLanClient(bind_ip=lifx_bind_ip)
+        try:
+            lifx_client = LifxLanClient(bind_ip=lifx_bind_ip)
+        except OSError as e:
+            print(f"Failed to create LIFX client (bind {lifx_bind_ip!r}): {e}")
+            return
     
     print(f"Auto-discovering {len(light_mappings)} configured light(s)...")
     

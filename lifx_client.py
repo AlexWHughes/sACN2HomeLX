@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 LIFX_PORT = 56700
 PROTO = 1024
 HEADER_SIZE = 36
+DEFAULT_BATCH_EXECUTOR_WORKERS = 3
 MIN_SEND_INTERVAL = 0.02  # seconds (rate limit) - allows up to 50Hz updates for smooth 40Hz sACN
 DEFAULT_KELVIN = 3500
 COLOR_SET_PROTECTION_TIME = 1.0  # seconds - prevent stale STATE_LIGHT responses from overwriting recently set colors
@@ -83,7 +84,8 @@ class LifxLight:
         self.current_saturation = 0
         self.current_brightness = 0
         self.current_kelvin = DEFAULT_KELVIN
-        self.current_rgb = (0.0, 0.0, 0.0)  # (r, g, b) as 0-1
+        # Display RGB as 8-bit ints (0–255), same shape as updates from set_rgb / STATE_LIGHT.
+        self.current_rgb = (0, 0, 0)
         self.color_set_time = 0.0  # Timestamp when color was last set via set_rgb
         self.state_requested_time = 0.0  # Timestamp when we requested state after setting color
         self.color_set_count = 0  # Count of recent color sets (for detecting active DMX updates)
@@ -100,7 +102,8 @@ class LifxLight:
 class LifxLanClient:
     def __init__(self, bind_ip: str = "0.0.0.0"):
         self.source = random.randint(2, 0xFFFFFFFF)
-        
+        self.requested_bind_ip = bind_ip
+
         # Performance optimization: batch processing
         self.command_queue = deque()  # Queue of commands to batch
         self.batch_size = 10  # Max commands per batch
@@ -108,7 +111,11 @@ class LifxLanClient:
         self.last_batch_send = 0.0
         self.batch_thread = None
         self.batch_running = False
-        self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="lifx_batch")
+        self.executor_max_workers = DEFAULT_BATCH_EXECUTOR_WORKERS
+        self.executor = ThreadPoolExecutor(
+            max_workers=self.executor_max_workers,
+            thread_name_prefix="lifx_batch",
+        )
         self.sequence = random.randint(0, 255)
         self.lights: Dict[bytes, LifxLight] = {}
         self.last_send = 0.0
@@ -120,8 +127,14 @@ class LifxLanClient:
         try:
             self.sock.bind((bind_ip, 0))
         except OSError as e:
-            print(f"Warning: Could not bind to {bind_ip}: {e}")
-            self.sock.bind(("0.0.0.0", 0))
+            self.sock.close()
+            raise OSError(f"Could not bind LIFX UDP socket to {bind_ip!r} (port 0): {e}") from e
+        sa = self.sock.getsockname()
+        if isinstance(sa, tuple) and len(sa) >= 2:
+            self.bound_ip, self.bound_port = sa[0], int(sa[1])
+        else:
+            # e.g. unit tests with a patched socket that does not implement getsockname()
+            self.bound_ip, self.bound_port = bind_ip, 0
         
         self.listening = True
         self.listener_thread = threading.Thread(target=self._listen, daemon=True)
@@ -380,7 +393,7 @@ class LifxLanClient:
                                 light.vendor = struct.unpack("<I", vendor_bytes)[0]
                                 light.product = struct.unpack("<I", product_bytes)[0]
                                 light.model_name = self._get_model_name(light.vendor, light.product)
-                                light.supported_modes = self._get_supported_modes(light.product)
+                                light.supported_modes = self._get_supported_modes()
                                 # Filter out switches and other non-light devices
                                 # Product IDs: 1=Original, 3=Color, 10=White, 11=Color 1000, etc.
                                 # Switches have different product IDs - filter them out
@@ -625,7 +638,7 @@ class LifxLanClient:
         
         return product_map.get(product, f"Unknown (product={product})")
     
-    def _get_supported_modes(self, product: int) -> List[str]:
+    def _get_supported_modes(self) -> List[str]:
         """DMX channel layouts supported by the bridge (all color LIFX products)."""
         return [
             "RGB (8bit)",
@@ -787,20 +800,29 @@ class LifxLanClient:
                         except Exception as e:
                             # Log error but don't crash - this is a background thread
                             import sys
+                            import traceback
+
                             try:
                                 target_str = target.hex() if target else "unknown"
-                            except:
+                            except Exception as fmt_err:
                                 target_str = str(target) if target else "unknown"
+                                print(
+                                    f"Warning: request_state_after_fade could not hex-format target ({fmt_err!r}); "
+                                    f"using target_str={target_str!r}",
+                                    file=sys.stderr,
+                                )
                             print(f"Error in request_state_after_fade for target {target_str}: {e}", file=sys.stderr)
-                            import traceback
                             traceback.print_exc(file=sys.stderr)
-                            # Clean up on error
                             try:
                                 with self.lock:
                                     if target and target in self.pending_state_requests and self.pending_state_requests[target] == cancel_event:
                                         del self.pending_state_requests[target]
-                            except:
-                                pass
+                            except Exception as cleanup_err:
+                                print(
+                                    f"Warning: request_state_after_fade pending_state_requests cleanup failed "
+                                    f"(target={target_str!r}, cancel_event={cancel_event!r}, lock={self.lock!r}): {cleanup_err!r}",
+                                    file=sys.stderr,
+                                )
                     
                     # Request state in background thread
                     threading.Thread(target=request_state_after_fade, daemon=True).start()
