@@ -15,7 +15,13 @@ Control LIFX lights via sACN/E1.31 with automatic discovery and web-based mappin
 - **Persistent Mappings**: Automatically saves your light mappings and settings to `config.json`
 - **Per-Light Brightness Control**: Adjust brightness multiplier (0-100%) for each light individually
 - **Real-Time Status**: Live DMX reception status showing active universes and packet counts
-- **Channel Mode Support**: RGB channel mode (3 channels per light)
+- **Channel Mode Support**: Multiple channel modes for flexible DMX control:
+  - **RGB (8bit)**: 3 channels - Red, Green, Blue (0-255 each)
+  - **RGB (16bit)**: 6 channels - Red, Green, Blue with 16-bit precision (MSB+LSB per color, 0-65535)
+  - **RGBW (8bit)**: 4 channels - Red, Green, Blue, White
+  - **RGBW (16bit)**: 8 channels - Red, Green, Blue, White with 16-bit precision (MSB+LSB per color, 0-65535)
+  - **HSBK (8bit)**: 4 channels - Hue, Saturation, Brightness, Kelvin (2500-9000K)
+  - **HSBK (16bit)**: 8 channels - HSBK with 16-bit precision (MSB+LSB per parameter)
 - **Optimized Performance**: 
   - 20ms fade duration for smooth 40Hz sACN transitions
   - 50Hz LIFX command rate limit for responsive updates
@@ -51,9 +57,9 @@ python app.py
 5. **Configure Light Mappings**:
    For each light, configure:
    - **Universe**: The DMX universe number (typically 1-512)
-   - **Start Channel**: The first DMX channel for this light (RGB uses 3 channels)
+   - **Start Channel**: The first DMX channel for this light
    - **Brightness**: Overall brightness multiplier (0-100%)
-   - **Channel Mode**: Currently supports RGB (3 channels)
+   - **Channel Mode**: Select from available modes (RGB (8bit): 3 channels, RGB (16bit): 6 channels, RGBW (8bit): 4 channels, RGBW (16bit): 8 channels, HSBK (8bit): 4 channels, HSBK (16bit): 8 channels)
 
 6. **Test Lights** (Optional):
    - Use the "Test RGB (DMX-less)" section to test lights directly
@@ -70,12 +76,52 @@ python app.py
 
 ## DMX Channel Mapping
 
-Each light uses 3 consecutive DMX channels for RGB mode:
+### RGB (8bit) - 3 channels
 - Channel N: Red (0-255)
 - Channel N+1: Green (0-255)
 - Channel N+2: Blue (0-255)
 
-For example, if a light is mapped to Universe 1, Channel 1:
+### RGB (16bit) - 6 channels
+- Channel N: Red MSB (Most Significant Byte)
+- Channel N+1: Red LSB (Least Significant Byte) → Combined: 0-65535
+- Channel N+2: Green MSB
+- Channel N+3: Green LSB → Combined: 0-65535
+- Channel N+4: Blue MSB
+- Channel N+5: Blue LSB → Combined: 0-65535
+
+### RGBW (8bit) - 4 channels
+- Channel N: Red (0-255)
+- Channel N+1: Green (0-255)
+- Channel N+2: Blue (0-255)
+- Channel N+3: White (0-255)
+
+### RGBW (16bit) - 8 channels
+- Channel N: Red MSB
+- Channel N+1: Red LSB → Combined: 0-65535
+- Channel N+2: Green MSB
+- Channel N+3: Green LSB → Combined: 0-65535
+- Channel N+4: Blue MSB
+- Channel N+5: Blue LSB → Combined: 0-65535
+- Channel N+6: White MSB
+- Channel N+7: White LSB → Combined: 0-65535
+
+### HSBK (8bit) - 4 channels
+- Channel N: Hue (0-255 → 0-360°)
+- Channel N+1: Saturation (0-255 → 0-100%)
+- Channel N+2: Brightness (0-255 → 0-100%)
+- Channel N+3: Kelvin (0-255 → 2500-9000K)
+
+### HSBK (16bit) - 8 channels
+- Channel N: Hue MSB
+- Channel N+1: Hue LSB → Combined: 0-65535 → 0-360°
+- Channel N+2: Saturation MSB
+- Channel N+3: Saturation LSB → Combined: 0-65535 → 0-100%
+- Channel N+4: Brightness MSB
+- Channel N+5: Brightness LSB → Combined: 0-65535 → 0-100%
+- Channel N+6: Kelvin MSB
+- Channel N+7: Kelvin LSB → Combined: 0-65535 → 2500-9000K
+
+**Example**: If a light is mapped to Universe 1, Channel 1 in RGB (8bit) mode:
 - Channel 1 = Red
 - Channel 2 = Green
 - Channel 3 = Blue
@@ -128,3 +174,7 @@ These settings can be adjusted in `app.py` if needed for different sACN frame ra
 - **DMX not receiving**: Check that the sACN interface is correctly configured and that your DMX source is sending to the correct universe.
 - **Stepping/jerky transitions**: The application is optimized for 40Hz sACN. If using a different frame rate, you may need to adjust `FADE_DURATION_MS` and `VALUE_CHANGE_THRESHOLD` in `app.py`.
 - **Configuration not saving**: Ensure the application has write permissions in the project directory.
+
+## Credits
+
+Special thanks to [@lyndonbuckley](https://github.com/lyndonbuckley) for suggesting the addition of 16-bit RGB and HSBK control modes, which provide higher precision color control for professional lighting applications.

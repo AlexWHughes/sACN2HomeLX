@@ -366,13 +366,18 @@
         let lights = [];
         let running = false;
         
+        let _notificationTimer = null;
         function showNotification(message, isError = false) {
-            const notif = document.getElementById('notification');
-            notif.textContent = message;
-            notif.className = 'notification' + (isError ? ' error' : '') + ' show';
-            setTimeout(() => {
-                notif.classList.remove('show');
-            }, 3000);
+            const el = document.getElementById('notification');
+            if (!el) return;
+            el.textContent = message;
+            el.classList.toggle('error', isError);
+            el.classList.add('show');
+            if (_notificationTimer) clearTimeout(_notificationTimer);
+            _notificationTimer = setTimeout(() => {
+                el.classList.remove('show');
+                _notificationTimer = null;
+            }, 4000);
         }
         
         async function validateJsonResponse(response) {
@@ -533,11 +538,16 @@
         
         async function loadLights() {
             try {
+                console.log('loadLights: Starting...');
                 // Save form values before re-rendering
                 const savedData = saveFormValues();
+                console.log('loadLights: Form values saved');
                 
+                console.log('loadLights: Fetching /api/lights...');
                 const response = await fetch('/api/lights');
+                console.log('loadLights: Response received:', response.status);
                 const data = await response.json();
+                console.log('loadLights: Data parsed:', data.success, 'configured:', data.configured_lights?.length);
                 
                 if (data.success) {
                     lights = data.lights; // Keep for backward compatibility
@@ -554,12 +564,19 @@
         
         function getChannelModeDescription(mode) {
             const descriptions = {
-                'RGB': '3 channels: Red, Green, Blue',
-                'RGBW': '4 channels: Red, Green, Blue, White',
-                'HSI': '3 channels: Hue (0-360°), Saturation (0-100%), Intensity (0-100%)',
-                'HSBK': '4 channels: Hue, Saturation, Brightness, Kelvin (2500-9000K)'
+                'RGB (8bit)': '3 channels: Red, Green, Blue (8-bit, 0-255)',
+                'RGB (16bit)': '6 channels: R,G,B — 16-bit coarse then fine per colour (MSB then LSB), 0-65535',
+                'RGB (16bit, fine first)': '6 channels: R,G,B — fine (LSB) then coarse (MSB) per colour, 0-65535',
+                'RGB + Intensity (8bit)': '4 channels: Red, Green, Blue, then master intensity (0-255) scales RGB',
+                'RGBW (8bit)': '4 channels: Red, Green, Blue, White (8-bit)',
+                'RGBW (16bit)': '8 channels: R,G,B,W — coarse then fine per channel, 0-65535',
+                'RGBW (16bit, fine first)': '8 channels: R,G,B,W — fine then coarse per channel, 0-65535',
+                'HSBK (8bit)': '4 channels: Hue (0-360°), Saturation, Brightness, Kelvin (2500-9000K), all 8-bit',
+                'HSBK (16bit)': '8 channels: H,S,B,K — coarse then fine per parameter, 0-65535 each',
+                'HSBK (16bit, fine first)': '8 channels: H,S,B,K — fine then coarse per parameter, 0-65535 each',
+                'HSBK + Intensity (8bit)': '5 channels: Hue, Saturation, Brightness, Kelvin (same as HSBK 8-bit), then dimmer (0-255) as master multiplier'
             };
-            return descriptions[mode] || descriptions['RGB'];
+            return descriptions[mode] || descriptions['RGB (8bit)'];
         }
         
         function updateChannelModeDescription(lightId, isEdit = false) {
@@ -612,7 +629,7 @@
                     light_id: lightId,
                     universe: universeNum,
                     start_channel: channelNum,
-                    channel_mode: channelMode || 'RGB'
+                    channel_mode: channelMode || 'RGB (8bit)'
                 };
                 
                 if (brightnessNum !== null && !isNaN(brightnessNum)) {
@@ -689,12 +706,12 @@
                                 <div class="form-group">
                                     <label>Channel Mode</label>
                                     <select id="edit-channel-mode-${light.id}" style="padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;" onchange="updateChannelModeDescription('${light.id}', true)">
-                                        ${(light.supported_modes || ['RGB']).map(mode => 
-                                            `<option value="${mode}" ${mapping.channel_mode === mode ? 'selected' : (mode === 'RGB' && !mapping.channel_mode ? 'selected' : '')}>${mode}</option>`
+                                        ${(light.supported_modes || ['RGB (8bit)']).map(mode => 
+                                            `<option value="${mode}" ${mapping.channel_mode === mode ? 'selected' : (mode === 'RGB (8bit)' && !mapping.channel_mode ? 'selected' : '')}>${mode}</option>`
                                         ).join('')}
                                     </select>
                                     <small id="edit-channel-mode-desc-${light.id}" style="color: #666; font-size: 0.85em; display: block; margin-top: 4px;">
-                                        ${getChannelModeDescription(mapping.channel_mode || 'RGB')}
+                                        ${getChannelModeDescription(mapping.channel_mode || 'RGB (8bit)')}
                                     </small>
                                 </div>
                                 <button class="btn btn-primary btn-small" onclick="updateMapping('${light.id}')">Save Changes</button>
@@ -742,12 +759,12 @@
                                 <div class="form-group">
                                     <label>Channel Mode</label>
                                     <select id="channel-mode-${light.id}" style="padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;" onchange="updateChannelModeDescription('${light.id}')">
-                                        ${(light.supported_modes || ['RGB']).map(mode => 
-                                            `<option value="${mode}" ${mode === 'RGB' ? 'selected' : ''}>${mode}</option>`
+                                        ${(light.supported_modes || ['RGB (8bit)']).map(mode => 
+                                            `<option value="${mode}" ${mode === 'RGB (8bit)' ? 'selected' : ''}>${mode}</option>`
                                         ).join('')}
                                     </select>
                                     <small id="channel-mode-desc-${light.id}" style="color: #666; font-size: 0.85em; display: block; margin-top: 4px;">
-                                        ${getChannelModeDescription('RGB')}
+                                        ${getChannelModeDescription('RGB (8bit)')}
                                     </small>
                                 </div>
                                 <button class="btn btn-primary btn-small" onclick="saveMapping('${light.id}')">Add Configuration</button>
@@ -897,10 +914,25 @@
         }
         
         function setTestColor(lightId, r, g, b) {
-            document.getElementById(`test-r-${lightId}`).value = r;
-            document.getElementById(`test-g-${lightId}`).value = g;
-            document.getElementById(`test-b-${lightId}`).value = b;
-            testRgb(lightId);
+            console.log('setTestColor called:', lightId, r, g, b);
+            const rEl = document.getElementById(`test-r-${lightId}`);
+            const gEl = document.getElementById(`test-g-${lightId}`);
+            const bEl = document.getElementById(`test-b-${lightId}`);
+            
+            if (!rEl || !gEl || !bEl) {
+                console.error('setTestColor: DOM elements not found for light', lightId);
+                showNotification('Error: Light controls not found', true);
+                return;
+            }
+            
+            rEl.value = r;
+            gEl.value = g;
+            bEl.value = b;
+            console.log('setTestColor: Calling testRgb for', lightId);
+            testRgb(lightId).catch(err => {
+                console.error('setTestColor: testRgb failed:', err);
+                showNotification('Error: ' + err.message, true);
+            });
         }
         
         // Store animation intervals
@@ -926,7 +958,7 @@
         }
         
         // Throttled version of testRgb - only sends network request if enough time has passed
-        async function testRgbThrottled(lightId, force = false) {
+        async function testRgbThrottled(lightId, force = false, suppressNotifications = true) {
             const now = Date.now();
             const lastCall = testRgbThrottle[lightId] || 0;
             const interval = getAnimationUpdateInterval();
@@ -934,40 +966,88 @@
             // If forced or enough time has passed, make the network request
             if (force || (now - lastCall) >= interval) {
                 testRgbThrottle[lightId] = now;
-                return await testRgb(lightId);
+                return await testRgb(lightId, suppressNotifications);
             }
             // Otherwise, just update the UI values without network request
             return Promise.resolve();
         }
         
-        async function testRgb(lightId) {
-            const r = parseInt(document.getElementById(`test-r-${lightId}`).value) || 0;
-            const g = parseInt(document.getElementById(`test-g-${lightId}`).value) || 0;
-            const b = parseInt(document.getElementById(`test-b-${lightId}`).value) || 0;
-            const brightness = (parseInt(document.getElementById(`test-brightness-${lightId}`).value) || 100) / 100.0;
+        async function testRgb(lightId, suppressNotifications = false) {
+            console.log('testRgb called:', lightId, 'suppressNotifications:', suppressNotifications);
+            
+            // Check if DOM elements exist before accessing them
+            const rEl = document.getElementById(`test-r-${lightId}`);
+            const gEl = document.getElementById(`test-g-${lightId}`);
+            const bEl = document.getElementById(`test-b-${lightId}`);
+            const brightnessEl = document.getElementById(`test-brightness-${lightId}`);
+            
+            // If elements don't exist, stop the animation silently
+            if (!rEl || !gEl || !bEl) {
+                console.warn(`testRgb: DOM elements not found for light ${lightId}, stopping animation`);
+                // Stop any running animations for this light
+                stopAnimation(lightId, 'chase');
+                stopAnimation(lightId, 'sinewave');
+                return;
+            }
+            
+            const r = parseInt(rEl.value) || 0;
+            const g = parseInt(gEl.value) || 0;
+            const b = parseInt(bEl.value) || 0;
+            const brightness = (parseInt(brightnessEl?.value) || 100) / 100.0;
+            
+            console.log('testRgb: Sending request with values:', { lightId, r, g, b, brightness });
             
             try {
-                const response = await fetch('/api/lights/test-rgb', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        light_id: lightId,
-                        r: r,
-                        g: g,
-                        b: b,
-                        brightness: brightness,
-                        fade_ms: 20
-                    })
-                });
+                const requestBody = {
+                    light_id: lightId,
+                    r: r,
+                    g: g,
+                    b: b,
+                    brightness: brightness,
+                    fade_ms: 20
+                };
+                console.log('testRgb: Request body:', requestBody);
                 
+                let response;
+                try {
+                    console.log('testRgb: Sending fetch request...');
+                    response = await fetch('/api/lights/test-rgb', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(requestBody)
+                    });
+                    console.log('testRgb: Response received - status:', response.status, response.statusText);
+                } catch (fetchError) {
+                    console.error('testRgb: Fetch failed:', fetchError);
+                    console.error('testRgb: Fetch error stack:', fetchError.stack);
+                    throw new Error('Network error: ' + fetchError.message);
+                }
+                
+                if (!response.ok) {
+                    console.error('testRgb: Response not OK:', response.status, response.statusText);
+                    const errorText = await response.text().catch(() => 'Unknown error');
+                    console.error('testRgb: Error response body:', errorText);
+                    throw new Error(`Server error (${response.status}): ${errorText}`);
+                }
+                
+                console.log('testRgb: Parsing JSON response...');
                 const data = await validateJsonResponse(response);
+                console.log('testRgb: Response data:', JSON.stringify(data));
                 
                 if (data.success) {
-                    showNotification(`Sent RGB(${r},${g},${b}) to ${data.light_label}`);
+                    // Only show notification if not suppressed (i.e., manual testing)
+                    if (!suppressNotifications) {
+                        showNotification(`Sent RGB(${r},${g},${b}) to ${data.light_label}`);
+                    }
                 } else {
-                    showNotification('Failed to send RGB: ' + data.error, true);
+                    // Always show errors, even during animations
+                    console.error('testRgb failed:', data.error);
+                    showNotification('Failed to send RGB: ' + (data.error || 'Unknown error'), true);
                 }
             } catch (error) {
+                // Always show errors, even during animations
+                console.error('testRgb exception:', error);
+                console.error('testRgb exception stack:', error.stack);
                 showNotification('Error: ' + error.message, true);
             }
         }
@@ -1038,18 +1118,38 @@
                 
                 // Set initial color
                 const initialColor = colors[colorIndex];
-                document.getElementById(`test-r-${lightId}`).value = initialColor.r;
-                document.getElementById(`test-g-${lightId}`).value = initialColor.g;
-                document.getElementById(`test-b-${lightId}`).value = initialColor.b;
-                testRgb(lightId); // Send initial color immediately
+                const rEl = document.getElementById(`test-r-${lightId}`);
+                const gEl = document.getElementById(`test-g-${lightId}`);
+                const bEl = document.getElementById(`test-b-${lightId}`);
+                
+                if (!rEl || !gEl || !bEl) {
+                    console.warn(`toggleRgbChase: DOM elements not found for light ${lightId}`);
+                    return;
+                }
+                
+                rEl.value = initialColor.r;
+                gEl.value = initialColor.g;
+                bEl.value = initialColor.b;
+                testRgb(lightId, true); // Send initial color immediately, suppress notifications
                 
                 const updateInterval = getAnimationUpdateInterval();
                 animationIntervals[key] = setInterval(() => {
+                    // Check if elements still exist before updating
+                    const rEl = document.getElementById(`test-r-${lightId}`);
+                    const gEl = document.getElementById(`test-g-${lightId}`);
+                    const bEl = document.getElementById(`test-b-${lightId}`);
+                    
+                    if (!rEl || !gEl || !bEl) {
+                        // Elements removed, stop animation
+                        stopAnimation(lightId, 'chase');
+                        return;
+                    }
+                    
                     colorIndex = (colorIndex + 1) % colors.length;
                     const color = colors[colorIndex];
-                    document.getElementById(`test-r-${lightId}`).value = color.r;
-                    document.getElementById(`test-g-${lightId}`).value = color.g;
-                    document.getElementById(`test-b-${lightId}`).value = color.b;
+                    rEl.value = color.r;
+                    gEl.value = color.g;
+                    bEl.value = color.b;
                     testRgbThrottled(lightId); // Use throttled version
                 }, updateInterval);
                 
@@ -1090,13 +1190,34 @@
                 const initialR = Math.floor((Math.sin(state.phase) + 1) / 2 * 255);
                 const initialG = Math.floor((Math.sin(state.phase + (2 * Math.PI / 3)) + 1) / 2 * 255);
                 const initialB = Math.floor((Math.sin(state.phase + (4 * Math.PI / 3)) + 1) / 2 * 255);
-                document.getElementById(`test-r-${lightId}`).value = initialR;
-                document.getElementById(`test-g-${lightId}`).value = initialG;
-                document.getElementById(`test-b-${lightId}`).value = initialB;
-                testRgb(lightId); // Send initial color immediately
+                
+                const rEl = document.getElementById(`test-r-${lightId}`);
+                const gEl = document.getElementById(`test-g-${lightId}`);
+                const bEl = document.getElementById(`test-b-${lightId}`);
+                
+                if (!rEl || !gEl || !bEl) {
+                    console.warn(`toggleSinewave: DOM elements not found for light ${lightId}`);
+                    return;
+                }
+                
+                rEl.value = initialR;
+                gEl.value = initialG;
+                bEl.value = initialB;
+                testRgb(lightId, true); // Send initial color immediately, suppress notifications
                 
                 // Update UI frequently for smooth visual feedback, but throttle network requests
                 animationIntervals[key] = setInterval(() => {
+                    // Check if elements still exist before updating
+                    const rEl = document.getElementById(`test-r-${lightId}`);
+                    const gEl = document.getElementById(`test-g-${lightId}`);
+                    const bEl = document.getElementById(`test-b-${lightId}`);
+                    
+                    if (!rEl || !gEl || !bEl) {
+                        // Elements removed, stop animation
+                        stopAnimation(lightId, 'sinewave');
+                        return;
+                    }
+                    
                     state.phase += speed;
                     if (state.phase >= Math.PI * 2) {
                         state.phase -= Math.PI * 2;
@@ -1111,9 +1232,9 @@
                     const b = Math.floor((Math.sin(state.phase + (4 * Math.PI / 3)) + 1) / 2 * 255);
                     
                     // Always update UI for smooth visual feedback
-                    document.getElementById(`test-r-${lightId}`).value = r;
-                    document.getElementById(`test-g-${lightId}`).value = g;
-                    document.getElementById(`test-b-${lightId}`).value = b;
+                    rEl.value = r;
+                    gEl.value = g;
+                    bEl.value = b;
                     
                     // Throttle network requests to reduce traffic
                     testRgbThrottled(lightId);

@@ -328,6 +328,63 @@ class TestRestartDmxIfRunning(unittest.TestCase):
         # No assertion needed - just verify no exception is raised
 
 
+class TestDmxU16Helpers(unittest.TestCase):
+    """16-bit DMX coarse/fine byte order helpers"""
+
+    def test_msb_first(self):
+        self.assertEqual(app._dmx_u16(0x12, 0x34, False), 0x1234)
+
+    def test_fine_first(self):
+        self.assertEqual(app._dmx_u16(0x34, 0x12, True), 0x1234)
+
+
+class TestListLightsApi(unittest.TestCase):
+    """GET /api/lights returns configured and unconfigured lists"""
+
+    def setUp(self):
+        self.flask_app = app.app
+        self.flask_app.config['TESTING'] = True
+        self.client = self.flask_app.test_client()
+        self._saved_mappings = dict(app.light_mappings)
+        self._saved_client = app.lifx_client
+
+    def tearDown(self):
+        app.light_mappings = self._saved_mappings
+        app.lifx_client = self._saved_client
+
+    def test_list_lights_no_client_empty_mappings(self):
+        app.light_mappings = {}
+        app.lifx_client = None
+        resp = self.client.get('/api/lights')
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['all_configured_lights'], [])
+        self.assertEqual(data['unconfigured_lights'], [])
+
+    def test_list_lights_shows_configured_offline(self):
+        app.lifx_client = None
+        app.light_mappings = {
+            'deadbeef': {
+                'universe': 1,
+                'start_channel': 10,
+                'brightness': 1.0,
+                'channel_mode': 'HSBK (16bit)',
+                'label': 'Stage Left',
+                'ip': '192.168.1.50',
+                'model': 'LIFX Color',
+            }
+        }
+        resp = self.client.get('/api/lights')
+        data = resp.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(len(data['all_configured_lights']), 1)
+        row = data['all_configured_lights'][0]
+        self.assertFalse(row['discovered'])
+        self.assertEqual(row['label'], 'Stage Left')
+        self.assertEqual(row['mapping']['channel_mode'], 'HSBK (16bit)')
+
+
 class TestNormalizeInterfaceIp(unittest.TestCase):
     """Test suite for _normalize_interface_ip helper function"""
     
