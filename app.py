@@ -268,8 +268,8 @@ def _rebuild_dmx_mapping_cache_if_dirty() -> None:
 # Store last sent values per light to implement change threshold
 _last_sent_values: Dict[str, List[int]] = {}  # light_id -> list of channel values
 
-# Performance optimization: batch processing for multiple fixtures
-_batch_commands = []  # List of (light, r, g, b, kelvin, duration_ms, brightness) to send in batch
+# Performance optimization: coalesced batch — at most one pending command per light (latest wins)
+_batch_commands_by_id: Dict[str, Tuple[LifxLight, float, float, float, int, int, float]] = {}
 _batch_lock = threading.Lock()
 _last_batch_time = 0.0
 BATCH_SIZE = 8  # Process up to 8 lights in parallel
@@ -296,9 +296,9 @@ _perf_lock = threading.Lock()
 
 def _lifx_send_one_batch():
     """Send up to BATCH_SIZE queued LIFX commands if rate interval allows (worker calls this in a loop)."""
-    global _batch_commands, _last_batch_time, _perf_metrics
+    global _batch_commands_by_id, _last_batch_time, _perf_metrics
     
-    if not _batch_commands or not lifx_client:
+    if not lifx_client:
         return
     
     current_time = time.time()
@@ -306,8 +306,10 @@ def _lifx_send_one_batch():
         return
     
     with _batch_lock:
-        batch = _batch_commands[:BATCH_SIZE]
-        _batch_commands = _batch_commands[BATCH_SIZE:]
+        if not _batch_commands_by_id:
+            return
+        keys = list(_batch_commands_by_id.keys())[:BATCH_SIZE]
+        batch = [_batch_commands_by_id.pop(k) for k in keys]
     
     if not batch:
         return
@@ -352,7 +354,7 @@ def _lifx_batch_sender_worker():
         if _batch_sender_stop.is_set():
             break
         with _batch_lock:
-            pending = len(_batch_commands) > 0
+            pending = len(_batch_commands_by_id) > 0
         if pending:
             wait_for = max(0.0, BATCH_INTERVAL - (time.time() - _last_batch_time))
             timeout = min(max(wait_for, 0.0005), BATCH_INTERVAL)
@@ -366,7 +368,7 @@ def _lifx_batch_sender_worker():
             if not running or not lifx_client:
                 break
             with _batch_lock:
-                if not _batch_commands:
+                if not _batch_commands_by_id:
                     break
             if time.time() - _last_batch_time < BATCH_INTERVAL:
                 break
@@ -644,8 +646,7 @@ def process_dmx_data(dmx_data: list, universe: int):
             s = saturation / MAX_SATURATION
             v = brightness_val / MAX_BRIGHTNESS
             
-            r, g, b = colorsys.hsv_to_rgb(h, s, v)
-            
+            r, g, b = colorsys.hsv_to_rgb(h, s, 1.0)
             bright_adj = brightness * v
             
             # Prepare for batch sending
@@ -660,7 +661,7 @@ def process_dmx_data(dmx_data: list, universe: int):
             h = hue / MAX_HUE
             s = saturation / MAX_SATURATION
             v = brightness_val / MAX_BRIGHTNESS
-            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            r, g, b = colorsys.hsv_to_rgb(h, s, 1.0)
             bright_adj = brightness * v * intensity
             cmd_data = (r, g, b, kelvin, FADE_DURATION_MS, bright_adj)
         
@@ -683,8 +684,7 @@ def process_dmx_data(dmx_data: list, universe: int):
             s = saturation / MAX_SATURATION
             v = brightness_val / MAX_BRIGHTNESS
             
-            r, g, b = colorsys.hsv_to_rgb(h, s, v)
-            
+            r, g, b = colorsys.hsv_to_rgb(h, s, 1.0)
             bright_adj = brightness * v
             
             if dmx_logger and enable_dmx_log:
@@ -706,7 +706,7 @@ def process_dmx_data(dmx_data: list, universe: int):
             h = hue / MAX_HUE
             s = saturation / MAX_SATURATION
             v = brightness_val / MAX_BRIGHTNESS
-            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            r, g, b = colorsys.hsv_to_rgb(h, s, 1.0)
             bright_adj = brightness * v
             cmd_data = (r, g, b, kelvin, FADE_DURATION_MS, bright_adj)
         
@@ -715,7 +715,9 @@ def process_dmx_data(dmx_data: list, universe: int):
     
     if frame_batch:
         with _batch_lock:
-            _batch_commands.extend(frame_batch)
+            for cmd in frame_batch:
+                lid = light_id(cmd[0])
+                _batch_commands_by_id[lid] = cmd
         _start_lifx_batch_sender_thread()
         _batch_sender_wake.set()
     
@@ -947,10 +949,9 @@ _interfaces_cache_ttl = 30  # Cache for 30 seconds
 
 @app.route('/api/interfaces', methods=['GET'])
 def get_interfaces():
-    """Get list of available network interfaces (cached, non-blocking)"""
+    """Get list of available network interfaces (cached; cold start loads synchronously)."""
     global _interfaces_cache, _interfaces_cache_time
     
-    # Return cached result if available and fresh
     current_time = time.time()
     if _interfaces_cache is not None and (current_time - _interfaces_cache_time) < _interfaces_cache_ttl:
         return jsonify({
@@ -960,7 +961,6 @@ def get_interfaces():
             'sacn_interface': sacn_interface
         })
     
-    # Get interfaces in background thread to avoid blocking
     def fetch_interfaces():
         global _interfaces_cache, _interfaces_cache_time
         try:
@@ -969,11 +969,17 @@ def get_interfaces():
         except Exception as e:
             print(f"Error fetching network interfaces: {e}")
     
-    # Start background fetch if cache is stale
-    if _interfaces_cache is None or (current_time - _interfaces_cache_time) >= _interfaces_cache_ttl:
+    if _interfaces_cache is None:
+        try:
+            _interfaces_cache = get_network_interfaces()
+            _interfaces_cache_time = time.time()
+        except Exception as e:
+            print(f"Error fetching network interfaces: {e}")
+            _interfaces_cache = []
+            _interfaces_cache_time = time.time()
+    elif (current_time - _interfaces_cache_time) >= _interfaces_cache_ttl:
         threading.Thread(target=fetch_interfaces, daemon=True).start()
     
-    # Return cached result (or empty if no cache yet)
     return jsonify({
         'success': True,
         'interfaces': _interfaces_cache if _interfaces_cache is not None else [],
@@ -1551,7 +1557,7 @@ def get_metrics():
             metrics['batch_efficiency'] = 0
         
         # Add current system load
-        metrics['current_queue_size'] = len(_batch_commands)
+        metrics['current_queue_size'] = len(_batch_commands_by_id)
         metrics['batch_utilization_percent'] = (metrics['avg_batch_size'] / BATCH_SIZE) * 100 if BATCH_SIZE > 0 else 0
         
         # Convert deque objects to lists for JSON serialization

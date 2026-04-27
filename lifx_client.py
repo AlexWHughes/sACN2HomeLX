@@ -123,11 +123,9 @@ class LifxLanClient:
             print(f"Warning: Could not bind to {bind_ip}: {e}")
             self.sock.bind(("0.0.0.0", 0))
         
+        self.listening = True
         self.listener_thread = threading.Thread(target=self._listen, daemon=True)
         self.listener_thread.start()
-        
-        # Add missing attributes
-        self.listening = True
         
         # Start batch processing thread
         self.batch_running = True
@@ -772,21 +770,20 @@ class LifxLanClient:
                         
                         # Only request if we haven't set another color in the meantime and color set count is still low
                         try:
+                            light_to_poll = None
                             with self.lock:
-                                # Remove from pending requests
                                 if target in self.pending_state_requests and self.pending_state_requests[target] == cancel_event:
                                     del self.pending_state_requests[target]
-                                
                                 if target in self.lights:
                                     light = self.lights[target]
-                                    # Safely access attributes with defaults
                                     color_set_time = getattr(light, 'color_set_time', 0)
                                     color_set_count = getattr(light, 'color_set_count', 0)
                                     time_since_set = time.time() - color_set_time
-                                    # Only request if color hasn't been updated recently and set count is still low
                                     if time_since_set >= fade_time - 0.1 and color_set_count <= 2:
                                         light.state_requested_time = time.time()
-                                        self._request_light_state(light)
+                                        light_to_poll = light
+                            if light_to_poll is not None:
+                                self._request_light_state(light_to_poll)
                         except Exception as e:
                             # Log error but don't crash - this is a background thread
                             import sys
@@ -835,7 +832,7 @@ class LifxLanClient:
         
         # Shutdown thread pool
         if hasattr(self, 'executor'):
-            self.executor.shutdown(wait=True, timeout=2.0)
+            self.executor.shutdown(wait=True)
         
         if self.sock:
             self.sock.close()
