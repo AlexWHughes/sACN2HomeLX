@@ -1,7 +1,12 @@
 import sacn
 import threading
 import time
+import queue
 from typing import Dict, Callable, Optional
+
+# Merge queued packet events into stats at most this often (bounded queue latency for UI)
+_STAT_DRAIN_INTERVAL_S = 0.05
+
 
 class DMXReceiver:
     """E1.31 (sACN) DMX receiver"""
@@ -18,14 +23,59 @@ class DMXReceiver:
             'packets_per_universe': {}
         }
         self.stats_lock = threading.Lock()
+        # Hot path: lock-free enqueue per packet; drain merges under stats_lock (periodic thread + get_stats)
+        self._stat_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._stat_drain_stop = threading.Event()
+        self._stat_drain_thread: Optional[threading.Thread] = None
         self._start_receiver()
+        self._start_stat_drain_thread()
+    
+    def _start_stat_drain_thread(self) -> None:
+        if self._stat_drain_thread is not None and self._stat_drain_thread.is_alive():
+            return
+        self._stat_drain_stop.clear()
+        self._stat_drain_thread = threading.Thread(
+            target=self._stat_drain_loop,
+            name='dmx_stat_drain',
+            daemon=True,
+        )
+        self._stat_drain_thread.start()
+    
+    def _stat_drain_loop(self) -> None:
+        while not self._stat_drain_stop.wait(timeout=_STAT_DRAIN_INTERVAL_S):
+            with self.stats_lock:
+                self._drain_stat_queue_locked()
+    
+    def _drain_stat_queue_locked(self) -> None:
+        """Drain all pending (universe, time) events into self.stats; caller must hold stats_lock."""
+        drained = 0
+        last_t = None
+        while True:
+            try:
+                u, t = self._stat_queue.get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
+            last_t = t
+            self.stats['packets_per_universe'][u] = self.stats['packets_per_universe'].get(u, 0) + 1
+            self.stats['active_universes'].add(u)
+        if drained:
+            self.stats['packets_received'] += drained
+            self.stats['last_packet_time'] = last_t
+    
+    def _stop_stat_drain_thread(self) -> None:
+        self._stat_drain_stop.set()
+        t = self._stat_drain_thread
+        self._stat_drain_thread = None
+        if t is not None and t.is_alive():
+            t.join(timeout=0.5)
     
     def _start_receiver(self):
         """Start the sACN receiver"""
         if self.receiver is not None:
             try:
                 self.receiver.stop()
-            except:
+            except Exception:
                 pass
         
         self.receiver = sacn.sACNreceiver(self.bind_ip) if self.bind_ip else sacn.sACNreceiver()
@@ -45,14 +95,8 @@ class DMXReceiver:
                 if not self.running:
                     return  # Don't process if not running
                 
-                # Update statistics
-                with self.stats_lock:
-                    self.stats['packets_received'] += 1
-                    self.stats['last_packet_time'] = time.time()
-                    self.stats['active_universes'].add(universe)
-                    if universe not in self.stats['packets_per_universe']:
-                        self.stats['packets_per_universe'][universe] = 0
-                    self.stats['packets_per_universe'][universe] += 1
+                # Statistics: enqueue only (no lock on hot path)
+                self._stat_queue.put((universe, time.time()))
                 
                 # Extract DMX data from packet
                 dmx_data = None
@@ -93,9 +137,9 @@ class DMXReceiver:
             # Continue anyway as unicast might still work
     
     def get_stats(self) -> Dict:
-        """Get current reception statistics"""
+        """Get current reception statistics (drains pending packet events first)."""
         with self.stats_lock:
-            # Check if we're receiving data (packet received in last 2 seconds)
+            self._drain_stat_queue_locked()
             receiving = False
             if self.stats['last_packet_time']:
                 time_since_last = time.time() - self.stats['last_packet_time']
@@ -110,9 +154,36 @@ class DMXReceiver:
                 'receiving': receiving
             }
     
+    def get_stats_nonblocking(self) -> Optional[Dict]:
+        """Same as get_stats if the stats lock can be taken immediately; otherwise None."""
+        if not self.stats_lock.acquire(blocking=False):
+            return None
+        try:
+            self._drain_stat_queue_locked()
+            receiving = False
+            if self.stats['last_packet_time']:
+                time_since_last = time.time() - self.stats['last_packet_time']
+                receiving = time_since_last < 2.0 and self.running
+            
+            return {
+                'packets_received': self.stats['packets_received'],
+                'last_packet_time': self.stats['last_packet_time'],
+                'active_universes': sorted(list(self.stats['active_universes'])),
+                'packets_per_universe': dict(self.stats['packets_per_universe']),
+                'running': self.running,
+                'receiving': receiving
+            }
+        finally:
+            self.stats_lock.release()
+    
     def reset_stats(self):
-        """Reset statistics"""
+        """Reset statistics and clear any queued packet events."""
         with self.stats_lock:
+            try:
+                while True:
+                    self._stat_queue.get_nowait()
+            except queue.Empty:
+                pass
             self.stats = {
                 'packets_received': 0,
                 'last_packet_time': None,
@@ -123,13 +194,14 @@ class DMXReceiver:
     def start(self):
         """Start receiving DMX data"""
         self.running = True
+        self._start_stat_drain_thread()
     
     def stop(self):
         """Stop receiving DMX data"""
         self.running = False
         self.receiver.stop()
+        self._stop_stat_drain_thread()
     
     def close(self):
         """Close the receiver"""
         self.stop()
-

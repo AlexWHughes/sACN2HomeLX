@@ -366,9 +366,18 @@
         let lights = [];
         let running = false;
         
+        let _notificationTimer = null;
         function showNotification(message, isError = false) {
-            // Notifications disabled
-            return;
+            const el = document.getElementById('notification');
+            if (!el) return;
+            el.textContent = message;
+            el.classList.toggle('error', isError);
+            el.classList.add('show');
+            if (_notificationTimer) clearTimeout(_notificationTimer);
+            _notificationTimer = setTimeout(() => {
+                el.classList.remove('show');
+                _notificationTimer = null;
+            }, 4000);
         }
         
         async function validateJsonResponse(response) {
@@ -556,11 +565,16 @@
         function getChannelModeDescription(mode) {
             const descriptions = {
                 'RGB (8bit)': '3 channels: Red, Green, Blue (8-bit, 0-255)',
-                'RGB (16bit)': '6 channels: Red, Green, Blue (16-bit, MSB+LSB per color, 0-65535)',
+                'RGB (16bit)': '6 channels: R,G,B — 16-bit coarse then fine per colour (MSB then LSB), 0-65535',
+                'RGB (16bit, fine first)': '6 channels: R,G,B — fine (LSB) then coarse (MSB) per colour, 0-65535',
+                'RGB + Intensity (8bit)': '4 channels: Red, Green, Blue, then master intensity (0-255) scales RGB',
                 'RGBW (8bit)': '4 channels: Red, Green, Blue, White (8-bit)',
-                'RGBW (16bit)': '8 channels: Red, Green, Blue, White (16-bit, MSB+LSB per color, 0-65535)',
-                'HSBK (8bit)': '4 channels: Hue, Saturation, Brightness, Kelvin (8-bit, 2500-9000K)',
-                'HSBK (16bit)': '8 channels: Hue, Saturation, Brightness, Kelvin (16-bit, MSB+LSB per parameter)'
+                'RGBW (16bit)': '8 channels: R,G,B,W — coarse then fine per channel, 0-65535',
+                'RGBW (16bit, fine first)': '8 channels: R,G,B,W — fine then coarse per channel, 0-65535',
+                'HSBK (8bit)': '4 channels: Hue (0-360°), Saturation, Brightness, Kelvin (2500-9000K), all 8-bit',
+                'HSBK (16bit)': '8 channels: H,S,B,K — coarse then fine per parameter, 0-65535 each',
+                'HSBK (16bit, fine first)': '8 channels: H,S,B,K — fine then coarse per parameter, 0-65535 each',
+                'HSBK + Intensity (8bit)': '5 channels: Hue, Saturation, Brightness, Kelvin (same as HSBK 8-bit), then dimmer (0-255) as master multiplier'
             };
             return descriptions[mode] || descriptions['RGB (8bit)'];
         }
@@ -615,7 +629,7 @@
                     light_id: lightId,
                     universe: universeNum,
                     start_channel: channelNum,
-                    channel_mode: channelMode || 'RGB'
+                    channel_mode: channelMode || 'RGB (8bit)'
                 };
                 
                 if (brightnessNum !== null && !isNaN(brightnessNum)) {

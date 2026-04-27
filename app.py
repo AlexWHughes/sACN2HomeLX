@@ -3,16 +3,18 @@
 sACN2LIFX - Control LIFX lights via sACN/E1.31
 """
 
-VERSION = "281225 047"
+VERSION = "270426 001"
 
 import json
 import os
+import hashlib
 import threading
 import time
 import colorsys
 import socket
 import logging
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
+from collections import deque
 from flask import Flask, render_template, jsonify, request
 from lifx_client import LifxLanClient, LifxLight
 from dmx_receiver import DMXReceiver
@@ -85,6 +87,49 @@ MAX_INTENSITY = 100  # Percentage
 FADE_DURATION_MS = 20  # Smooth fade duration for color transitions (milliseconds) - optimized for 40Hz sACN
 VALUE_CHANGE_THRESHOLD = 1  # Only update if DMX value changed by this much (0-255) - lower for smoother transitions
 
+# DMX channel modes (single source for UI + processing). MSB-first 16-bit = coarse then fine per parameter.
+CHANNELS_FOR_MODE: Dict[str, int] = {
+    'RGB (8bit)': 3,
+    'RGB (16bit)': 6,
+    'RGB (16bit, fine first)': 6,
+    'RGB + Intensity (8bit)': 4,
+    'RGBW (8bit)': 4,
+    'RGBW (16bit)': 8,
+    'RGBW (16bit, fine first)': 8,
+    'HSBK (8bit)': 4,
+    'HSBK (16bit)': 8,
+    'HSBK (16bit, fine first)': 8,
+    'HSBK + Intensity (8bit)': 5,
+}
+
+ALL_CHANNEL_MODES: List[str] = list(CHANNELS_FOR_MODE.keys())
+
+
+def _dmx_u16(msb: int, lsb: int, fine_first: bool) -> int:
+    """Combine two DMX bytes into 0..65535 (big-endian coarse/fine, or fine-first if requested)."""
+    if fine_first:
+        return ((lsb & 0xFF) << 8) | (msb & 0xFF)
+    return ((msb & 0xFF) << 8) | (lsb & 0xFF)
+
+
+def _u16_pairs_changed(
+    channel_values: list,
+    last_values: list,
+    num_pairs: int,
+    fine_first: bool,
+) -> bool:
+    """True if any 16-bit pair (num_pairs pairs starting at index 0) changed."""
+    need = num_pairs * 2
+    if len(channel_values) < need or len(last_values) < need:
+        return True
+    for p in range(num_pairs):
+        i = p * 2
+        cur = _dmx_u16(channel_values[i], channel_values[i + 1], fine_first)
+        prev = _dmx_u16(last_values[i], last_values[i + 1], fine_first)
+        if abs(cur - prev) >= 1:
+            return True
+    return False
+
 
 def load_config():
     """Load configuration (mappings and settings) from file"""
@@ -97,6 +142,7 @@ def load_config():
                 light_mappings = {}
                 lifx_interface = None
                 sacn_interface = None
+                invalidate_dmx_mapping_cache()
                 return
             
             config = json.loads(content)
@@ -113,6 +159,7 @@ def load_config():
         light_mappings = {}
         lifx_interface = None
         sacn_interface = None
+    invalidate_dmx_mapping_cache()
 
 
 def save_config():
@@ -189,14 +236,181 @@ def light_id(light: LifxLight) -> str:
     return light.target.hex()
 
 
+# Cache: universe -> [(light_id, mapping), ...] — rebuilt when light_mappings change (hot DMX path skips full dict scan)
+_dmx_mapping_cache_dirty = True
+_mappings_by_universe: Dict[int, List[Tuple[str, Dict]]] = {}
+
+
+def invalidate_dmx_mapping_cache() -> None:
+    """Call after any change to light_mappings."""
+    global _dmx_mapping_cache_dirty
+    _dmx_mapping_cache_dirty = True
+
+
+def _rebuild_dmx_mapping_cache_if_dirty() -> None:
+    global _mappings_by_universe, _dmx_mapping_cache_dirty
+    if not _dmx_mapping_cache_dirty:
+        return
+    idx: Dict[int, List[Tuple[str, Dict]]] = {}
+    for lid, m in light_mappings.items():
+        u = m.get('universe')
+        if u is None:
+            continue
+        try:
+            ui = int(u)
+        except (TypeError, ValueError):
+            continue
+        idx.setdefault(ui, []).append((lid, m))
+    _mappings_by_universe = idx
+    _dmx_mapping_cache_dirty = False
+
+
 # Store last sent values per light to implement change threshold
 _last_sent_values: Dict[str, List[int]] = {}  # light_id -> list of channel values
+
+# Performance optimization: batch processing for multiple fixtures
+_batch_commands = []  # List of (light, r, g, b, kelvin, duration_ms, brightness) to send in batch
+_batch_lock = threading.Lock()
+_last_batch_time = 0.0
+BATCH_SIZE = 8  # Process up to 8 lights in parallel
+BATCH_INTERVAL = 0.02  # 20ms between batches (50Hz)
+
+_batch_sender_thread: Optional[threading.Thread] = None
+_batch_sender_stop: threading.Event = threading.Event()
+_batch_sender_wake = threading.Event()
+_batch_sender_start_lock = threading.Lock()
+
+# Performance monitoring for multi-fixture setups
+_perf_metrics = {
+    'total_frames_processed': 0,
+    'total_commands_sent': 0,
+    'total_batches_sent': 0,
+    'avg_batch_size': 0.0,
+    'avg_frame_processing_time': 0.0,
+    'peak_fixtures_per_frame': 0,
+    'last_reset_time': time.time(),
+    'frame_times': deque(maxlen=100),  # Last 100 frame times for rolling average
+    'batch_sizes': deque(maxlen=50)    # Last 50 batch sizes
+}
+_perf_lock = threading.Lock()
+
+def _lifx_send_one_batch():
+    """Send up to BATCH_SIZE queued LIFX commands if rate interval allows (worker calls this in a loop)."""
+    global _batch_commands, _last_batch_time, _perf_metrics
+    
+    if not _batch_commands or not lifx_client:
+        return
+    
+    current_time = time.time()
+    if current_time - _last_batch_time < BATCH_INTERVAL:
+        return
+    
+    with _batch_lock:
+        batch = _batch_commands[:BATCH_SIZE]
+        _batch_commands = _batch_commands[BATCH_SIZE:]
+    
+    if not batch:
+        return
+    
+    batch_size = len(batch)
+    
+    if hasattr(lifx_client, 'set_rgb_batch'):
+        for light, r, g, b, kelvin, duration_ms, brightness in batch:
+            lifx_client.set_rgb_batch(light.target, light.ip, r, g, b,
+                                    kelvin=kelvin, duration_ms=duration_ms, brightness=brightness)
+    else:
+        futures = []
+        for light, r, g, b, kelvin, duration_ms, brightness in batch:
+            future = lifx_client.executor.submit(
+                lifx_client.set_rgb, light.target, light.ip, r, g, b,
+                kelvin=kelvin, duration_ms=duration_ms, brightness=brightness
+            )
+            futures.append(future)
+        for future in futures:
+            try:
+                future.result(timeout=0.05)
+            except Exception as e:
+                if dmx_logger:
+                    dmx_logger.warning(f"Error in batch send: {e}")
+    
+    _last_batch_time = current_time
+    
+    with _perf_lock:
+        _perf_metrics['total_batches_sent'] += 1
+        _perf_metrics['total_commands_sent'] += batch_size
+        _perf_metrics['batch_sizes'].append(batch_size)
+        _perf_metrics['peak_fixtures_per_frame'] = max(_perf_metrics['peak_fixtures_per_frame'], batch_size)
+        if len(_perf_metrics['batch_sizes']) > 0:
+            _perf_metrics['avg_batch_size'] = sum(_perf_metrics['batch_sizes']) / len(_perf_metrics['batch_sizes'])
+
+
+def _lifx_batch_sender_worker():
+    """Single daemon thread: wake on new DMX commands or interval; drain queue at BATCH_INTERVAL without spawning timers."""
+    global running, lifx_client, _batch_sender_stop, _batch_sender_wake
+    
+    while True:
+        if _batch_sender_stop.is_set():
+            break
+        with _batch_lock:
+            pending = len(_batch_commands) > 0
+        if pending:
+            wait_for = max(0.0, BATCH_INTERVAL - (time.time() - _last_batch_time))
+            timeout = min(max(wait_for, 0.0005), BATCH_INTERVAL)
+        else:
+            timeout = 0.1
+        _batch_sender_wake.wait(timeout=timeout)
+        if _batch_sender_stop.is_set():
+            break
+        _batch_sender_wake.clear()
+        while not _batch_sender_stop.is_set():
+            if not running or not lifx_client:
+                break
+            with _batch_lock:
+                if not _batch_commands:
+                    break
+            if time.time() - _last_batch_time < BATCH_INTERVAL:
+                break
+            _lifx_send_one_batch()
+
+
+def _start_lifx_batch_sender_thread():
+    """Start background sender if not already running (call when DMX processing starts)."""
+    global _batch_sender_thread, _batch_sender_stop, _batch_sender_wake
+    
+    with _batch_sender_start_lock:
+        if _batch_sender_thread is not None and _batch_sender_thread.is_alive():
+            return
+        _batch_sender_stop = threading.Event()
+        _batch_sender_wake.clear()
+        t = threading.Thread(target=_lifx_batch_sender_worker, daemon=True, name='lifx_batch_sender')
+        _batch_sender_thread = t
+        t.start()
+
+
+def _stop_lifx_batch_sender_thread():
+    """Stop background sender (call when DMX processing stops)."""
+    global _batch_sender_thread
+    
+    with _batch_sender_start_lock:
+        t = _batch_sender_thread
+        if t is None:
+            return
+        _batch_sender_stop.set()
+        _batch_sender_wake.set()
+        _batch_sender_thread = None
+    t.join(timeout=1.0)
+
 
 def process_dmx_data(dmx_data: list, universe: int):
     """Process incoming DMX data and update lights"""
     global lifx_client, light_mappings, _last_sent_values, _dmx_frame_counter
     
     if not lifx_client or not running:
+        return
+    
+    _rebuild_dmx_mapping_cache_if_dirty()
+    mapping_entries = _mappings_by_universe.get(universe)
+    if not mapping_entries:
         return
     
     # Performance logging: track start time and frame counter
@@ -210,28 +424,13 @@ def process_dmx_data(dmx_data: list, universe: int):
     if dmx_logger and enable_dmx_log:
         dmx_logger.info(f"DMX received: universe={universe}, data_len={len(dmx_data)}")
     
-    # Build a lookup of lights by ID for faster access
-    # First try filtered lights (excludes switches)
-    lights = lifx_client.get_lights()
-    lights_by_id = {light_id(light): light for light in lights}
-    
-    # Also check raw lights dictionary for configured lights that might be filtered out
-    # This allows configured lights to work even if they're misidentified as switches
-    # (Some devices may be incorrectly identified as switches but are actually lights)
+    # Single lock, one pass (equivalent to former get_lights() + dict snapshot)
     with lifx_client.lock:
-        raw_lights = lifx_client.lights
-        for target, light in raw_lights.items():
-            lid = light_id(light)
-            if lid not in lights_by_id and lid in light_mappings:
-                # This is a configured light that was filtered out - include it anyway
-                # We trust the user's configuration over automatic detection
-                lights_by_id[lid] = light
+        lights_by_id = {light_id(L): L for L in lifx_client.lights.values()}
     
-    # Iterate through mappings to ensure correct light-channel mapping
-    for mapped_light_id, mapping in light_mappings.items():
-        if mapping.get('universe') != universe:
-            continue
-        
+    frame_batch: List[tuple] = []
+    
+    for mapped_light_id, mapping in mapping_entries:
         # Find the light for this mapping
         light = lights_by_id.get(mapped_light_id)
         if not light:
@@ -240,16 +439,10 @@ def process_dmx_data(dmx_data: list, universe: int):
         start_channel = mapping.get('start_channel', 0) - 1  # Convert to 0-based
         brightness = mapping.get('brightness', MAX_BRIGHTNESS)
         channel_mode = mapping.get('channel_mode', 'RGB (8bit)')
+        if channel_mode not in CHANNELS_FOR_MODE:
+            channel_mode = 'RGB (8bit)'
         
-        # Determine number of channels based on mode
-        channels_needed = {
-            'RGB (8bit)': 3,      # 8-bit RGB (3 channels)
-            'RGB (16bit)': 6,     # 16-bit RGB (6 channels: MSB+LSB per color)
-            'RGBW (8bit)': 4,     # 8-bit RGBW (4 channels)
-            'RGBW (16bit)': 8,    # 16-bit RGBW (8 channels: MSB+LSB per color)
-            'HSBK (8bit)': 4,     # 8-bit HSBK (4 channels)
-            'HSBK (16bit)': 8     # 16-bit HSBK (8 channels: MSB+LSB per parameter)
-        }.get(channel_mode, 3)
+        channels_needed = CHANNELS_FOR_MODE.get(channel_mode, 3)
         
         if start_channel < 0 or start_channel + channels_needed > len(dmx_data):
             continue
@@ -263,45 +456,18 @@ def process_dmx_data(dmx_data: list, universe: int):
             has_significant_change = False
             max_change = 0
             
-            # For 16-bit modes, check combined 16-bit values instead of individual channels
             if channel_mode == 'RGB (16bit)' and len(channel_values) >= 6 and len(last_values) >= 6:
-                # Compare combined 16-bit RGB values
-                for color_idx in range(3):  # R, G, B
-                    msb_idx = color_idx * 2
-                    lsb_idx = color_idx * 2 + 1
-                    current_16bit = (channel_values[msb_idx] << 8) | channel_values[lsb_idx]
-                    last_16bit = (last_values[msb_idx] << 8) | last_values[lsb_idx]
-                    change = abs(current_16bit - last_16bit)
-                    max_change = max(max_change, change)
-                    # For 16-bit, use a threshold of 1 (any change in combined value triggers update)
-                    # This allows fine-grained control while still filtering out identical values
-                    if change >= 1:
-                        has_significant_change = True
-                        break
+                has_significant_change = _u16_pairs_changed(channel_values, last_values, 3, fine_first=False)
+            elif channel_mode == 'RGB (16bit, fine first)' and len(channel_values) >= 6 and len(last_values) >= 6:
+                has_significant_change = _u16_pairs_changed(channel_values, last_values, 3, fine_first=True)
             elif channel_mode == 'RGBW (16bit)' and len(channel_values) >= 8 and len(last_values) >= 8:
-                # Compare combined 16-bit RGBW values
-                for color_idx in range(4):  # R, G, B, W
-                    msb_idx = color_idx * 2
-                    lsb_idx = color_idx * 2 + 1
-                    current_16bit = (channel_values[msb_idx] << 8) | channel_values[lsb_idx]
-                    last_16bit = (last_values[msb_idx] << 8) | last_values[lsb_idx]
-                    change = abs(current_16bit - last_16bit)
-                    max_change = max(max_change, change)
-                    if change >= 1:
-                        has_significant_change = True
-                        break
+                has_significant_change = _u16_pairs_changed(channel_values, last_values, 4, fine_first=False)
+            elif channel_mode == 'RGBW (16bit, fine first)' and len(channel_values) >= 8 and len(last_values) >= 8:
+                has_significant_change = _u16_pairs_changed(channel_values, last_values, 4, fine_first=True)
             elif channel_mode == 'HSBK (16bit)' and len(channel_values) >= 8 and len(last_values) >= 8:
-                # Compare combined 16-bit HSBK values
-                for param_idx in range(4):  # H, S, B, K
-                    msb_idx = param_idx * 2
-                    lsb_idx = param_idx * 2 + 1
-                    current_16bit = (channel_values[msb_idx] << 8) | channel_values[lsb_idx]
-                    last_16bit = (last_values[msb_idx] << 8) | last_values[lsb_idx]
-                    change = abs(current_16bit - last_16bit)
-                    max_change = max(max_change, change)
-                    if change >= 1:
-                        has_significant_change = True
-                        break
+                has_significant_change = _u16_pairs_changed(channel_values, last_values, 4, fine_first=False)
+            elif channel_mode == 'HSBK (16bit, fine first)' and len(channel_values) >= 8 and len(last_values) >= 8:
+                has_significant_change = _u16_pairs_changed(channel_values, last_values, 4, fine_first=True)
             else:
                 # For 8-bit modes, check individual channel values
                 for i, val in enumerate(channel_values):
@@ -322,7 +488,8 @@ def process_dmx_data(dmx_data: list, universe: int):
         # Store current values
         _last_sent_values[mapped_light_id] = list(channel_values)
         
-        # Convert based on channel mode
+        # Prepare for batch processing
+        cmd_data = None  # (r, g, b, kelvin, duration_ms, brightness)
         if channel_mode == 'RGB (8bit)':
             r = channel_values[0] / MAX_RGB_PER_COLOUR
             g = channel_values[1] / MAX_RGB_PER_COLOUR
@@ -341,23 +508,8 @@ def process_dmx_data(dmx_data: list, universe: int):
                 rgb_int = (int(r * 255), int(g * 255), int(b * 255))
                 dmx_logger.info(f"  → {light.label}: RGB=({rgb_int[0]},{rgb_int[1]},{rgb_int[2]}), DMX={channel_values}, brightness={bright_adj:.2f}, fade={FADE_DURATION_MS}ms")
             
-            send_start = None
-            if enable_perf_logging:
-                send_start = time.time()
-            
-            lifx_client.set_rgb(
-                light.target,
-                light.ip,
-                r, g, b,
-                kelvin=DEFAULT_KELVIN,
-                duration_ms=FADE_DURATION_MS,
-                brightness=bright_adj
-            )
-            
-            if enable_perf_logging and send_start is not None:
-                send_duration = (time.time() - send_start) * 1000
-                if send_duration > PERF_SEND_THRESHOLD_MS:
-                    dmx_logger.warning(f"    SLOW send: {send_duration:.1f}ms")
+            # Prepare for batch sending
+            cmd_data = (r, g, b, DEFAULT_KELVIN, FADE_DURATION_MS, bright_adj)
         
         elif channel_mode == 'RGB (16bit)':
             # RGB16: 16-bit per channel (6 channels total: MSB+LSB for each color)
@@ -383,23 +535,27 @@ def process_dmx_data(dmx_data: list, universe: int):
                 rgb_int = (int(r * 255), int(g * 255), int(b * 255))
                 dmx_logger.info(f"  → {light.label}: RGB16=({r_16bit},{g_16bit},{b_16bit}) → RGB=({rgb_int[0]},{rgb_int[1]},{rgb_int[2]}), brightness={bright_adj:.2f}, fade={FADE_DURATION_MS}ms")
             
-            send_start = None
-            if enable_perf_logging:
-                send_start = time.time()
-            
-            lifx_client.set_rgb(
-                light.target,
-                light.ip,
-                r, g, b,
-                kelvin=DEFAULT_KELVIN,
-                duration_ms=FADE_DURATION_MS,
-                brightness=bright_adj
-            )
-            
-            if enable_perf_logging and send_start is not None:
-                send_duration = (time.time() - send_start) * 1000
-                if send_duration > PERF_SEND_THRESHOLD_MS:
-                    dmx_logger.warning(f"    SLOW send: {send_duration:.1f}ms")
+            # Prepare for batch sending
+            cmd_data = (r, g, b, DEFAULT_KELVIN, FADE_DURATION_MS, bright_adj)
+        
+        elif channel_mode == 'RGB (16bit, fine first)':
+            r_16bit = _dmx_u16(channel_values[0], channel_values[1], fine_first=True)
+            g_16bit = _dmx_u16(channel_values[2], channel_values[3], fine_first=True)
+            b_16bit = _dmx_u16(channel_values[4], channel_values[5], fine_first=True)
+            r = max(0.0, min(1.0, r_16bit / 65535.0))
+            g = max(0.0, min(1.0, g_16bit / 65535.0))
+            b = max(0.0, min(1.0, b_16bit / 65535.0))
+            bright_adj = brightness
+            cmd_data = (r, g, b, DEFAULT_KELVIN, FADE_DURATION_MS, bright_adj)
+        
+        elif channel_mode == 'RGB + Intensity (8bit)':
+            intensity = channel_values[3] / MAX_RGB_PER_COLOUR
+            intensity = max(0.0, min(1.0, intensity))
+            r = max(0.0, min(1.0, (channel_values[0] / MAX_RGB_PER_COLOUR) * intensity))
+            g = max(0.0, min(1.0, (channel_values[1] / MAX_RGB_PER_COLOUR) * intensity))
+            b = max(0.0, min(1.0, (channel_values[2] / MAX_RGB_PER_COLOUR) * intensity))
+            bright_adj = brightness
+            cmd_data = (r, g, b, DEFAULT_KELVIN, FADE_DURATION_MS, bright_adj)
         
         elif channel_mode == 'RGBW (8bit)':
             r = channel_values[0] / MAX_RGB_PER_COLOUR
@@ -422,23 +578,8 @@ def process_dmx_data(dmx_data: list, universe: int):
             # Apply brightness multiplier from mapping
             bright_adj = brightness
             
-            send_start = None
-            if enable_perf_logging:
-                send_start = time.time()
-            
-            lifx_client.set_rgb(
-                light.target,
-                light.ip,
-                r, g, b,
-                kelvin=DEFAULT_KELVIN,
-                duration_ms=FADE_DURATION_MS,
-                brightness=bright_adj
-            )
-            
-            if enable_perf_logging and send_start is not None:
-                send_duration = (time.time() - send_start) * 1000
-                if send_duration > PERF_SEND_THRESHOLD_MS:
-                    dmx_logger.warning(f"    SLOW send: {send_duration:.1f}ms")
+            # Prepare for batch sending
+            cmd_data = (r, g, b, DEFAULT_KELVIN, FADE_DURATION_MS, bright_adj)
         
         elif channel_mode == 'RGBW (16bit)':
             # RGBW16: 16-bit per channel (8 channels total: MSB+LSB for each color)
@@ -473,30 +614,30 @@ def process_dmx_data(dmx_data: list, universe: int):
                 rgb_int = (int(r * 255), int(g * 255), int(b * 255))
                 dmx_logger.info(f"  → {light.label}: RGBW16=({r_16bit},{g_16bit},{b_16bit},{w_16bit}) → RGB=({rgb_int[0]},{rgb_int[1]},{rgb_int[2]}), brightness={bright_adj:.2f}, fade={FADE_DURATION_MS}ms")
             
-            send_start = None
-            if enable_perf_logging:
-                send_start = time.time()
-            
-            lifx_client.set_rgb(
-                light.target,
-                light.ip,
-                r, g, b,
-                kelvin=DEFAULT_KELVIN,
-                duration_ms=FADE_DURATION_MS,
-                brightness=bright_adj
-            )
-            
-            if enable_perf_logging and send_start is not None:
-                send_duration = (time.time() - send_start) * 1000
-                if send_duration > PERF_SEND_THRESHOLD_MS:
-                    dmx_logger.warning(f"    SLOW send: {send_duration:.1f}ms")
+            # Prepare for batch sending
+            cmd_data = (r, g, b, DEFAULT_KELVIN, FADE_DURATION_MS, bright_adj)
+        
+        elif channel_mode == 'RGBW (16bit, fine first)':
+            r_16bit = _dmx_u16(channel_values[0], channel_values[1], fine_first=True)
+            g_16bit = _dmx_u16(channel_values[2], channel_values[3], fine_first=True)
+            b_16bit = _dmx_u16(channel_values[4], channel_values[5], fine_first=True)
+            w_16bit = _dmx_u16(channel_values[6], channel_values[7], fine_first=True)
+            r = max(0.0, min(1.0, r_16bit / 65535.0))
+            g = max(0.0, min(1.0, g_16bit / 65535.0))
+            b = max(0.0, min(1.0, b_16bit / 65535.0))
+            w = max(0.0, min(1.0, w_16bit / 65535.0))
+            r = min(1.0, r + w * 0.3)
+            g = min(1.0, g + w * 0.3)
+            b = min(1.0, b + w * 0.3)
+            bright_adj = brightness
+            cmd_data = (r, g, b, DEFAULT_KELVIN, FADE_DURATION_MS, bright_adj)
         
         elif channel_mode == 'HSBK (8bit)':
             # HSBK8: 8-bit HSBK - Hue (0-360), Saturation (0-100), Brightness (0-100), Kelvin (2500-9000)
             hue = (channel_values[0] / 255.0) * MAX_HUE
             saturation = (channel_values[1] / 255.0) * MAX_SATURATION
             brightness_val = (channel_values[2] / 255.0) * MAX_BRIGHTNESS
-            kelvin = int(2500 + (channel_values[3] / 255.0) * (9000 - 2500))
+            kelvin = int(max(2500, min(9000, 2500 + (channel_values[3] / 255.0) * (9000 - 2500))))
             
             # Convert HS to RGB
             h = hue / MAX_HUE
@@ -507,23 +648,21 @@ def process_dmx_data(dmx_data: list, universe: int):
             
             bright_adj = brightness * v
             
-            send_start = None
-            if enable_perf_logging:
-                send_start = time.time()
-            
-            lifx_client.set_rgb(
-                light.target,
-                light.ip,
-                r, g, b,
-                kelvin=kelvin,
-                duration_ms=FADE_DURATION_MS,
-                brightness=bright_adj
-            )
-            
-            if enable_perf_logging and send_start is not None:
-                send_duration = (time.time() - send_start) * 1000
-                if send_duration > PERF_SEND_THRESHOLD_MS:
-                    dmx_logger.warning(f"    SLOW send: {send_duration:.1f}ms")
+            # Prepare for batch sending
+            cmd_data = (r, g, b, kelvin, FADE_DURATION_MS, bright_adj)
+        
+        elif channel_mode == 'HSBK + Intensity (8bit)':
+            hue = (channel_values[0] / 255.0) * MAX_HUE
+            saturation = (channel_values[1] / 255.0) * MAX_SATURATION
+            brightness_val = (channel_values[2] / 255.0) * MAX_BRIGHTNESS
+            kelvin = int(max(2500, min(9000, 2500 + (channel_values[3] / 255.0) * (9000 - 2500))))
+            intensity = max(0.0, min(1.0, channel_values[4] / 255.0))
+            h = hue / MAX_HUE
+            s = saturation / MAX_SATURATION
+            v = brightness_val / MAX_BRIGHTNESS
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            bright_adj = brightness * v * intensity
+            cmd_data = (r, g, b, kelvin, FADE_DURATION_MS, bright_adj)
         
         elif channel_mode == 'HSBK (16bit)':
             # HSBK16: 16-bit HSBK - 8 channels: MSB+LSB for each parameter
@@ -537,7 +676,7 @@ def process_dmx_data(dmx_data: list, universe: int):
             hue = (hue_16bit / 65535.0) * MAX_HUE  # 0-360°
             saturation = (saturation_16bit / 65535.0) * MAX_SATURATION  # 0-100%
             brightness_val = (brightness_16bit / 65535.0) * MAX_BRIGHTNESS  # 0-100%
-            kelvin = int(2500 + (kelvin_16bit / 65535.0) * (9000 - 2500))  # 2500-9000K
+            kelvin = int(max(2500, min(9000, 2500 + (kelvin_16bit / 65535.0) * (9000 - 2500))))  # 2500-9000K
             
             # Convert HS to RGB
             h = hue / MAX_HUE
@@ -552,23 +691,47 @@ def process_dmx_data(dmx_data: list, universe: int):
                 rgb_int = (int(r * 255), int(g * 255), int(b * 255))
                 dmx_logger.info(f"  → {light.label}: HSBK16=({hue_16bit},{saturation_16bit},{brightness_16bit},{kelvin_16bit}) → H={hue:.1f}° S={saturation:.1f}% B={brightness_val:.1f}% K={kelvin}K → RGB=({rgb_int[0]},{rgb_int[1]},{rgb_int[2]}), brightness={bright_adj:.2f}, fade={FADE_DURATION_MS}ms")
             
-            send_start = None
-            if enable_perf_logging:
-                send_start = time.time()
+            # Prepare for batch sending
+            cmd_data = (r, g, b, kelvin, FADE_DURATION_MS, bright_adj)
+        
+        elif channel_mode == 'HSBK (16bit, fine first)':
+            hue_16bit = _dmx_u16(channel_values[0], channel_values[1], fine_first=True)
+            saturation_16bit = _dmx_u16(channel_values[2], channel_values[3], fine_first=True)
+            brightness_16bit = _dmx_u16(channel_values[4], channel_values[5], fine_first=True)
+            kelvin_16bit = _dmx_u16(channel_values[6], channel_values[7], fine_first=True)
+            hue = (hue_16bit / 65535.0) * MAX_HUE
+            saturation = (saturation_16bit / 65535.0) * MAX_SATURATION
+            brightness_val = (brightness_16bit / 65535.0) * MAX_BRIGHTNESS
+            kelvin = int(max(2500, min(9000, 2500 + (kelvin_16bit / 65535.0) * (9000 - 2500))))
+            h = hue / MAX_HUE
+            s = saturation / MAX_SATURATION
+            v = brightness_val / MAX_BRIGHTNESS
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            bright_adj = brightness * v
+            cmd_data = (r, g, b, kelvin, FADE_DURATION_MS, bright_adj)
+        
+        if cmd_data:
+            frame_batch.append((light, *cmd_data))
+    
+    if frame_batch:
+        with _batch_lock:
+            _batch_commands.extend(frame_batch)
+        _start_lifx_batch_sender_thread()
+        _batch_sender_wake.set()
+    
+    # Update performance metrics
+    with _perf_lock:
+        _perf_metrics['total_frames_processed'] += 1
+        
+        if process_start is not None:
+            process_duration = time.time() - process_start
+            _perf_metrics['frame_times'].append(process_duration)
             
-            lifx_client.set_rgb(
-                light.target,
-                light.ip,
-                r, g, b,
-                kelvin=kelvin,
-                duration_ms=FADE_DURATION_MS,
-                brightness=bright_adj
-            )
-            
-            if enable_perf_logging and send_start is not None:
-                send_duration = (time.time() - send_start) * 1000
-                if send_duration > PERF_SEND_THRESHOLD_MS:
-                    dmx_logger.warning(f"    SLOW send: {send_duration:.1f}ms")
+            # Update rolling average
+            if len(_perf_metrics['frame_times']) > 0:
+                _perf_metrics['avg_frame_processing_time'] = (
+                    sum(_perf_metrics['frame_times']) / len(_perf_metrics['frame_times'])
+                ) * 1000  # Convert to ms
     
     # Log total processing time for this DMX frame (only if performance logging enabled)
     if enable_perf_logging and process_start is not None:
@@ -702,6 +865,81 @@ def index():
     return render_template('index.html', version=VERSION)
 
 
+@app.route('/api/lights', methods=['GET'])
+def list_lights():
+    """Return discovered lights and configured mappings for the web UI."""
+    global lifx_client, light_mappings
+    
+    discovered_by_id: Dict[str, LifxLight] = {}
+    lights_list: List[LifxLight] = []
+    if lifx_client:
+        lights_list = lifx_client.get_lights()
+        for light in lights_list:
+            discovered_by_id[light_id(light)] = light
+        with lifx_client.lock:
+            for target, light in lifx_client.lights.items():
+                lid = light_id(light)
+                if lid not in discovered_by_id and lid in light_mappings:
+                    discovered_by_id[lid] = light
+    
+    all_configured: List[Dict] = []
+    for lid, mapping in light_mappings.items():
+        light = discovered_by_id.get(lid)
+        if light:
+            all_configured.append({
+                'id': lid,
+                'label': light.label or mapping.get('label') or lid,
+                'ip': light.ip,
+                'model': light.model_name,
+                'discovered': True,
+                'supported_modes': ALL_CHANNEL_MODES,
+                'mapping': mapping,
+            })
+        else:
+            all_configured.append({
+                'id': lid,
+                'label': mapping.get('label') or f'Light {lid[:10]}',
+                'ip': mapping.get('ip') or '',
+                'model': mapping.get('model') or 'Unknown',
+                'discovered': False,
+                'supported_modes': ALL_CHANNEL_MODES,
+                'mapping': mapping,
+            })
+    
+    unconfigured: List[Dict] = []
+    for light in lights_list:
+        lid = light_id(light)
+        if lid not in light_mappings:
+            unconfigured.append({
+                'id': lid,
+                'label': light.label or f"Light {light.ip}",
+                'ip': light.ip,
+                'model': light.model_name,
+                'supported_modes': ALL_CHANNEL_MODES,
+            })
+    
+    lights_summary = [
+        {
+            'id': light_id(light),
+            'label': light.label or f"Light {light.ip}",
+            'ip': light.ip,
+            'model': light.model_name,
+        }
+        for light in lights_list
+    ]
+    
+    manual_only = [x for x in all_configured if str(x['id']).startswith('manual_')]
+    
+    return jsonify({
+        'success': True,
+        'lights': lights_summary,
+        'configured_lights': all_configured,
+        'unconfigured_lights': unconfigured,
+        'manual_lights': manual_only,
+        'all_configured_lights': all_configured,
+    })
+
+
 # Cache for network interfaces to avoid blocking calls
 _interfaces_cache = None
 _interfaces_cache_time = 0
@@ -823,7 +1061,7 @@ def discover_lights():
                 'target': light.target.hex(),
                 'model': light.model_name,
                 'product_id': light.product,
-                'supported_modes': getattr(light, 'supported_modes', ['RGB (8bit)', 'RGB (16bit)', 'RGBW (8bit)', 'RGBW (16bit)', 'HSBK (8bit)', 'HSBK (16bit)'])
+                'supported_modes': ALL_CHANNEL_MODES,
             }
             for light in lights
         ]
@@ -928,17 +1166,25 @@ def update_mapping():
             brightness_float = existing_mapping.get('brightness', MAX_BRIGHTNESS)
         
         # Build mapping with explicit values from request
+        mode_str = str(channel_mode) if channel_mode else existing_mapping.get('channel_mode', 'RGB (8bit)')
+        if mode_str not in CHANNELS_FOR_MODE:
+            mode_str = existing_mapping.get('channel_mode', 'RGB (8bit)')
+        if mode_str not in CHANNELS_FOR_MODE:
+            mode_str = 'RGB (8bit)'
+        
         mapping = {
             'universe': universe_int,
             'start_channel': start_channel_int,
             'brightness': brightness_float,
-            'channel_mode': str(channel_mode) if channel_mode else existing_mapping.get('channel_mode', 'RGB (8bit)'),
+            'channel_mode': mode_str,
             'label': light_label,  # Store label for display when not discovered
             'model': light_model,  # Store model for display when not discovered
             'ip': light_ip  # Store IP for auto-discovery
         }
         
         light_mappings[mapped_light_id] = mapping
+        _last_sent_values.pop(mapped_light_id, None)
+        invalidate_dmx_mapping_cache()
         save_config()
         
         # Restart DMX worker if running
@@ -957,6 +1203,8 @@ def delete_mapping(light_id):
     
     if light_id in light_mappings:
         del light_mappings[light_id]
+        _last_sent_values.pop(light_id, None)
+        invalidate_dmx_mapping_cache()
         save_config()
         
         # Restart DMX worker if running
@@ -1009,16 +1257,15 @@ def add_manual_light():
         lid = light.target.hex()
         light_label = light.label or label or f"Light {ip}"
         light_model = light.model_name or 'Unknown Model'
-        supported_modes = getattr(light, 'supported_modes', ['RGB (8bit)', 'RGB (16bit)', 'RGBW (8bit)', 'RGBW (16bit)', 'HSBK (8bit)', 'HSBK (16bit)'])
+        supported_modes = ALL_CHANNEL_MODES
     else:
         # Create a placeholder ID based on IP (will be updated when discovered)
         # Use a hash of the IP to create a consistent ID
-        import hashlib
         ip_hash = hashlib.md5(ip.encode()).hexdigest()[:16]
         lid = f"manual_{ip_hash}"
         light_label = label or f"Light {ip}"
         light_model = 'Not discovered'
-        supported_modes = ['RGB (8bit)', 'RGB (16bit)', 'RGBW (8bit)', 'RGBW (16bit)', 'HSBK (8bit)', 'HSBK (16bit)']
+        supported_modes = ALL_CHANNEL_MODES
     
     # Check if mapping already exists for this light_id
     if lid in light_mappings:
@@ -1036,6 +1283,7 @@ def add_manual_light():
     }
     
     light_mappings[lid] = mapping
+    invalidate_dmx_mapping_cache()
     save_config()
     
     # If light was discovered, add it to the client's lights list
@@ -1087,6 +1335,8 @@ def start_dmx():
             dmx_thread = threading.Thread(target=dmx_worker, daemon=True)
             dmx_thread.start()
         
+        _start_lifx_batch_sender_thread()
+        
         return jsonify({'success': True})
     except Exception as e:
         import traceback
@@ -1102,6 +1352,8 @@ def stop_dmx():
     with dmx_lock:
         running = False
     
+    _stop_lifx_batch_sender_thread()
+    
     if dmx_receiver:
         dmx_receiver.stop()
         dmx_receiver.reset_stats()
@@ -1115,33 +1367,16 @@ def get_status():
     dmx_stats = {}
     if dmx_receiver:
         try:
-            # Try to get stats without blocking
-            # get_stats() acquires the lock internally, so we need to check if we can acquire it first
-            if dmx_receiver.stats_lock.acquire(blocking=False):
-                try:
-                    # We have the lock, but get_stats() will try to acquire it again
-                    # So we'll read the stats directly
-                    stats = dmx_receiver.stats
-                    current_time = time.time()
-                    receiving = False
-                    if stats['last_packet_time']:
-                        time_since_last = current_time - stats['last_packet_time']
-                        receiving = time_since_last < 2.0 and dmx_receiver.running
-                    
-                    dmx_stats = {
-                        'packets_received': stats['packets_received'],
-                        'last_packet_time': stats['last_packet_time'],
-                        'active_universes': sorted(list(stats['active_universes'])),
-                        'packets_per_universe': dict(stats['packets_per_universe']),
-                        'receiving': receiving
-                    }
-                finally:
-                    dmx_receiver.stats_lock.release()
-            else:
-                # Lock is held, return empty stats
-                dmx_stats = {}
+            full = dmx_receiver.get_stats_nonblocking()
+            if full is not None:
+                dmx_stats = {
+                    'packets_received': full['packets_received'],
+                    'last_packet_time': full['last_packet_time'],
+                    'active_universes': full['active_universes'],
+                    'packets_per_universe': full['packets_per_universe'],
+                    'receiving': full['receiving'],
+                }
         except Exception:
-            # If anything fails, return empty stats
             dmx_stats = {}
     
     # Count discovered lights without blocking (try to get count, but don't wait for lock)
@@ -1174,12 +1409,32 @@ def get_status():
     except Exception:
         running_status = False
     
+    # Add performance metrics to status
+    with _perf_lock:
+        perf_copy = dict(_perf_metrics)
+        # Calculate current uptime in seconds
+        uptime = time.time() - perf_copy['last_reset_time']
+        perf_copy['uptime_seconds'] = uptime
+        
+        # Calculate commands per second
+        if uptime > 0:
+            perf_copy['commands_per_second'] = perf_copy['total_commands_sent'] / uptime
+            perf_copy['frames_per_second'] = perf_copy['total_frames_processed'] / uptime
+        else:
+            perf_copy['commands_per_second'] = 0
+            perf_copy['frames_per_second'] = 0
+        
+        # Convert deque objects to lists for JSON serialization
+        perf_copy['frame_times'] = list(perf_copy['frame_times'])
+        perf_copy['batch_sizes'] = list(perf_copy['batch_sizes'])
+    
     return jsonify({
         'success': True,
         'running': running_status,
         'lights_count': discovered_count,
         'mappings_count': mappings_count,
-        'dmx_stats': dmx_stats
+        'dmx_stats': dmx_stats,
+        'performance_metrics': perf_copy
     })
 
 
@@ -1266,6 +1521,51 @@ def test_rgb():
         'success': True,
         'message': f'Sending RGB({r},{g},{b}) to {light_label}',
         'light_label': light_label
+    })
+
+
+@app.route('/api/metrics', methods=['GET'])
+def get_metrics():
+    """Get detailed performance metrics for multi-fixture setups"""
+    with _perf_lock:
+        metrics = dict(_perf_metrics)
+        
+        # Calculate derived metrics
+        uptime = time.time() - metrics['last_reset_time']
+        metrics['uptime_seconds'] = uptime
+        metrics['uptime_formatted'] = f"{uptime/3600:.1f}h" if uptime > 3600 else f"{uptime/60:.1f}m"
+        
+        if uptime > 0:
+            metrics['commands_per_second'] = metrics['total_commands_sent'] / uptime
+            metrics['frames_per_second'] = metrics['total_frames_processed'] / uptime
+            metrics['batches_per_second'] = metrics['total_batches_sent'] / uptime
+        else:
+            metrics['commands_per_second'] = 0
+            metrics['frames_per_second'] = 0
+            metrics['batches_per_second'] = 0
+        
+        # Calculate efficiency metrics
+        if metrics['total_batches_sent'] > 0:
+            metrics['batch_efficiency'] = metrics['avg_batch_size'] / BATCH_SIZE
+        else:
+            metrics['batch_efficiency'] = 0
+        
+        # Add current system load
+        metrics['current_queue_size'] = len(_batch_commands)
+        metrics['batch_utilization_percent'] = (metrics['avg_batch_size'] / BATCH_SIZE) * 100 if BATCH_SIZE > 0 else 0
+        
+        # Convert deque objects to lists for JSON serialization
+        metrics['frame_times'] = list(metrics['frame_times'])
+        metrics['batch_sizes'] = list(metrics['batch_sizes'])
+    
+    return jsonify({
+        'success': True,
+        'metrics': metrics,
+        'batch_config': {
+            'batch_size': BATCH_SIZE,
+            'batch_interval_ms': BATCH_INTERVAL * 1000,
+            'max_workers': lifx_client.executor._max_workers if lifx_client and hasattr(lifx_client, 'executor') else 3
+        }
     })
 
 

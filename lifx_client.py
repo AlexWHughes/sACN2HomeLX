@@ -5,6 +5,8 @@ import random
 import colorsys
 import threading
 from typing import Dict, Optional, List, Tuple
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 # =========================
 # LIFX CONSTANTS
@@ -81,11 +83,11 @@ class LifxLight:
         self.current_saturation = 0
         self.current_brightness = 0
         self.current_kelvin = DEFAULT_KELVIN
-        self.current_rgb = (0, 0, 0)  # (r, g, b) as 0-255
-        self.color_set_time = 0  # Timestamp when color was last set via set_rgb
-        self.state_requested_time = 0  # Timestamp when we requested state after setting color
+        self.current_rgb = (0.0, 0.0, 0.0)  # (r, g, b) as 0-1
+        self.color_set_time = 0.0  # Timestamp when color was last set via set_rgb
+        self.state_requested_time = 0.0  # Timestamp when we requested state after setting color
         self.color_set_count = 0  # Count of recent color sets (for detecting active DMX updates)
-        self.last_color_set_check = 0  # Timestamp of last color set count check
+        self.last_color_set_check = 0.0  # Timestamp of last color set count check
 
     def __repr__(self):
         return f"LifxLight(label='{self.label}', ip='{self.ip}', model='{self.model_name}')"
@@ -98,50 +100,39 @@ class LifxLight:
 class LifxLanClient:
     def __init__(self, bind_ip: str = "0.0.0.0"):
         self.source = random.randint(2, 0xFFFFFFFF)
+        
+        # Performance optimization: batch processing
+        self.command_queue = deque()  # Queue of commands to batch
+        self.batch_size = 10  # Max commands per batch
+        self.batch_timeout = 0.005  # 5ms max wait for batch accumulation
+        self.last_batch_send = 0.0
+        self.batch_thread = None
+        self.batch_running = False
+        self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="lifx_batch")
         self.sequence = random.randint(0, 255)
         self.lights: Dict[bytes, LifxLight] = {}
         self.last_send = 0.0
         self.lock = threading.Lock()
+        self.pending_state_requests: Dict[bytes, threading.Event] = {}
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(0.5)
         try:
             self.sock.bind((bind_ip, 0))
-        except OSError:
-            # If binding to specific IP fails (e.g., IP not assigned to interface),
-            # fall back to binding to all interfaces
-            # On Windows, use '' (empty string) for all interfaces; on Unix, '0.0.0.0' works
-            import sys
-            fallback_ip = '' if sys.platform == 'win32' else '0.0.0.0'
-            try:
-                self.sock.bind((fallback_ip, 0))
-                print(f"Warning: Could not bind to {bind_ip}, using all interfaces instead")
-            except OSError as e:
-                # If even fallback fails, try '0.0.0.0' on Windows as last resort
-                if sys.platform == 'win32' and fallback_ip == '':
-                    try:
-                        self.sock.bind(('0.0.0.0', 0))
-                        print(f"Warning: Could not bind to {bind_ip}, using 0.0.0.0 instead")
-                    except OSError:
-                        raise
-                else:
-                    raise
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-        # Track pending state request threads per light to prevent accumulation
-        # Maps target (bytes) -> threading.Event (cancellation flag)
-        self.pending_state_requests: Dict[bytes, threading.Event] = {}
-
-        # Start listener thread
+        except OSError as e:
+            print(f"Warning: Could not bind to {bind_ip}: {e}")
+            self.sock.bind(("0.0.0.0", 0))
+        
+        self.listener_thread = threading.Thread(target=self._listen, daemon=True)
+        self.listener_thread.start()
+        
+        # Add missing attributes
         self.listening = True
-        self.listener_thread = None
-        self._start_listener()
-    
-    def _start_listener(self):
-        """Start the listener thread if not already running"""
-        if self.listener_thread is None or not self.listener_thread.is_alive():
-            self.listener_thread = threading.Thread(target=self._listen, daemon=True)
-            self.listener_thread.start()
+        
+        # Start batch processing thread
+        self.batch_running = True
+        self.batch_thread = threading.Thread(target=self._batch_worker, daemon=True)
+        self.batch_thread.start()
 
     def _next_seq(self):
         self.sequence = (self.sequence + 1) & 0xFF
@@ -152,6 +143,105 @@ class LifxLanClient:
         if dt < MIN_SEND_INTERVAL:
             time.sleep(MIN_SEND_INTERVAL - dt)
         self.last_send = time.time()
+
+    def _batch_worker(self):
+        """Background thread for batch processing commands"""
+        while self.batch_running:
+            try:
+                if len(self.command_queue) >= self.batch_size:
+                    # Send batch immediately if we have enough commands
+                    self._send_batch()
+                elif (time.time() - self.last_batch_send > self.batch_timeout and 
+                      len(self.command_queue) > 0):
+                    # Send batch if timeout reached and we have pending commands
+                    self._send_batch()
+                else:
+                    # Small sleep to prevent busy waiting
+                    time.sleep(0.001)
+            except Exception as e:
+                print(f"Error in batch worker: {e}")
+                time.sleep(0.01)
+
+    def _send_batch(self):
+        """Send a batch of commands efficiently"""
+        if not self.command_queue:
+            return
+            
+        # Get a batch of commands
+        batch = []
+        while len(batch) < self.batch_size and self.command_queue:
+            batch.append(self.command_queue.popleft())
+        
+        if not batch:
+            return
+            
+        # Sequential UDP sends (avoid thread-pool overhead for tiny packets)
+        for cmd_data in batch:
+            try:
+                self._send_command_raw(*cmd_data)
+            except Exception as e:
+                print(f"Error sending batch command: {e}")
+        
+        self.last_batch_send = time.time()
+        
+        # Apply rate limiting after batch
+        self._rate_limit()
+
+    def _send_command_raw(self, packet: bytes, ip: str):
+        """Send raw packet without rate limiting (used in batches)"""
+        try:
+            self.sock.sendto(packet, (ip, LIFX_PORT))
+        except Exception as e:
+            print(f"Error sending command to {ip}: {e}")
+
+    def set_rgb_batch(self, target: bytes, ip: str, r: float, g: float, b: float, 
+                     kelvin: int = DEFAULT_KELVIN, duration_ms: int = 0, brightness: float = 1.0):
+        """Queue RGB command for batch processing"""
+        r = clamp01(r)
+        g = clamp01(g)
+        b = clamp01(b)
+        
+        needs_power_on = False
+        with self.lock:
+            if target in self.lights:
+                light = self.lights[target]
+                if light.power == 0:
+                    needs_power_on = True
+                    light.power = 65535
+        
+        if needs_power_on:
+            self.set_power(target, ip, True)
+        
+        hue, sat, bri, kel = rgb01_to_hsbk(r, g, b, kelvin)
+        bri = int(bri * brightness) & 0xFFFF
+
+        header = self._build_header(SET_COLOR, target=target, tagged=False)
+        payload = struct.pack("<BHHHHI", 0, hue, sat, bri, kel, int(duration_ms))
+        packet = self._finalise(header + payload)
+        
+        now = time.time()
+        with self.lock:
+            self.command_queue.append((packet, ip))
+            if target in self.lights:
+                light = self.lights[target]
+                light.current_hue = hue
+                light.current_saturation = sat
+                light.current_brightness = bri
+                light.current_kelvin = kel
+                h = hue / 65535.0
+                s = sat / 65535.0
+                v = bri / 65535.0
+                r_displayed, g_displayed, b_displayed = colorsys.hsv_to_rgb(h, s, v)
+                light.current_rgb = (
+                    int(r_displayed * 255),
+                    int(g_displayed * 255),
+                    int(b_displayed * 255),
+                )
+                light.color_set_time = now
+                if now - light.last_color_set_check > COLOR_SET_RESET_INTERVAL:
+                    light.color_set_count = 0
+                    light.last_color_set_check = now
+                light.color_set_count += 1
 
     def _build_header(self, msg_type: int, target: Optional[bytes] = None, tagged: bool = False):
         addressable = 1
@@ -538,13 +628,20 @@ class LifxLanClient:
         return product_map.get(product, f"Unknown (product={product})")
     
     def _get_supported_modes(self, product: int) -> List[str]:
-        """Determine supported channel modes based on product ID"""
-        # All LIFX lights support RGB (8bit), RGB (16bit), RGBW (8bit), RGBW (16bit), HSBK (8bit), and HSBK (16bit)
-        # RGBW can be used on any light - the white channel will be blended into RGB
-        # 16-bit modes provide higher precision for professional lighting control
-        modes = ["RGB (8bit)", "RGB (16bit)", "RGBW (8bit)", "RGBW (16bit)", "HSBK (8bit)", "HSBK (16bit)"]
-        
-        return modes
+        """DMX channel layouts supported by the bridge (all color LIFX products)."""
+        return [
+            "RGB (8bit)",
+            "RGB (16bit)",
+            "RGB (16bit, fine first)",
+            "RGB + Intensity (8bit)",
+            "RGBW (8bit)",
+            "RGBW (16bit)",
+            "RGBW (16bit, fine first)",
+            "HSBK (8bit)",
+            "HSBK (16bit)",
+            "HSBK (16bit, fine first)",
+            "HSBK + Intensity (8bit)",
+        ]
 
     def refresh_lights(self):
         """Refresh the list of discovered lights"""
@@ -724,12 +821,21 @@ class LifxLanClient:
     def close(self):
         """Close the client and cleanup"""
         self.listening = False
+        self.batch_running = False
         
         # Cancel all pending state requests
         with self.lock:
             for cancel_event in self.pending_state_requests.values():
                 cancel_event.set()
             self.pending_state_requests.clear()
+        
+        # Stop batch thread
+        if self.batch_thread and self.batch_thread.is_alive():
+            self.batch_thread.join(timeout=1.0)
+        
+        # Shutdown thread pool
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=True, timeout=2.0)
         
         if self.sock:
             self.sock.close()
