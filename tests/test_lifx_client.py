@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock, MagicMock, patch
 import time
 import colorsys
+import socket
 import struct
 import sys
 import os
@@ -456,6 +457,14 @@ class TestHelperFunctions(unittest.TestCase):
         """Test rgb01_to_hsbk with black"""
         _hue, _sat, bri, _kel = rgb01_to_hsbk(0.0, 0.0, 0.0)
         self.assertEqual(bri, 0)  # No brightness for black
+
+    def test_rgb01_to_hsbk_hold_hue_when_dim(self):
+        """Near-black should keep the previous hue instead of snapping to red."""
+        blue_hue, _sat, _bri, _kel = rgb01_to_hsbk(0.0, 0.0, 1.0)
+        held_hue, sat, bri, _kel2 = rgb01_to_hsbk(0.0, 0.0, 0.0, hold_hue=blue_hue)
+        self.assertEqual(held_hue, blue_hue)
+        self.assertEqual(sat, 0)
+        self.assertEqual(bri, 0)
     
     def test_rgb01_to_hsbk_gray(self):
         """Test rgb01_to_hsbk with gray (no saturation, mid brightness)"""
@@ -505,6 +514,254 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertGreaterEqual(bri, 0)
         self.assertLessEqual(bri, 65535)
         self.assertEqual(kel, 4500)
+
+
+class TestDiscoveryBroadcast(unittest.TestCase):
+    """UDP broadcast discovery requires SO_BROADCAST (Errno 13 otherwise)."""
+
+    def _mock_client(self):
+        mock_sock = MagicMock()
+        mock_sock.getsockname.return_value = ('0.0.0.0', 12345)
+        mock_sock.recvfrom.side_effect = socket.timeout
+        with patch('socket.socket', return_value=mock_sock):
+            client = LifxLanClient(bind_ip="0.0.0.0")
+        client.listening = False
+        client.batch_running = False
+        return client, mock_sock
+
+    def test_socket_enables_broadcast(self):
+        client, mock_sock = self._mock_client()
+        try:
+            mock_sock.setsockopt.assert_any_call(
+                socket.SOL_SOCKET, socket.SO_BROADCAST, 1
+            )
+        finally:
+            client.close()
+
+    @patch('time.sleep')
+    def test_discover_sends_limited_broadcast(self, _mock_sleep):
+        client, mock_sock = self._mock_client()
+        try:
+            client.discover_lights(timeout=0)
+            dests = [call.args[1] for call in mock_sock.sendto.call_args_list]
+            self.assertIn(('255.255.255.255', lifx_client.LIFX_PORT), dests)
+        finally:
+            client.close()
+
+    def test_live_socket_broadcast_does_not_raise_permission_denied(self):
+        client = LifxLanClient(bind_ip="0.0.0.0")
+        try:
+            self.assertNotEqual(
+                client.sock.getsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST), 0
+            )
+            try:
+                client.sock.sendto(b'\x00', ('255.255.255.255', lifx_client.LIFX_PORT))
+            except PermissionError:
+                self.fail(
+                    "Broadcast send raised PermissionError; SO_BROADCAST is not effective"
+                )
+            except OSError as exc:
+                self.skipTest(
+                    f"Broadcast send unavailable in this environment: {exc}"
+                )
+        finally:
+            client.close()
+
+
+class TestProductRegistry(unittest.TestCase):
+    """New SuperColour products must resolve from the LIFX product catalog."""
+
+    def setUp(self):
+        mock_sock = MagicMock()
+        mock_sock.getsockname.return_value = ('0.0.0.0', 12345)
+        mock_sock.recvfrom.side_effect = socket.timeout
+        with patch('socket.socket', return_value=mock_sock):
+            self.client = LifxLanClient(bind_ip="0.0.0.0")
+        self.client.listening = False
+        self.client.batch_running = False
+
+    def tearDown(self):
+        self.client.close()
+
+    def test_supercolour_tube_intl_product_218(self):
+        self.assertEqual(
+            self.client._get_model_name(1, 218),
+            "LIFX SuperColour Tube",
+        )
+        self.assertFalse(self.client._is_switch_product(218, "LIFX SuperColour Tube"))
+
+    def test_supercolour_tube_product_217(self):
+        self.assertEqual(
+            self.client._get_model_name(1, 217),
+            "LIFX SuperColour Tube",
+        )
+
+    def test_supercolour_luna_products(self):
+        self.assertEqual(self.client._get_model_name(1, 219), "LIFX SuperColour Luna")
+        self.assertEqual(self.client._get_model_name(1, 220), "LIFX SuperColour Luna")
+
+    def test_switch_products_are_not_lights(self):
+        self.assertEqual(self.client._get_model_name(1, 70), "LIFX Switch")
+        self.assertTrue(self.client._is_switch_product(70, "LIFX Switch"))
+        self.assertTrue(self.client._is_switch_product(226, "LIFX Dimmer Switch"))
+
+    def test_candle_is_not_classified_as_switch(self):
+        self.assertEqual(self.client._get_model_name(1, 68), "LIFX Candle C")
+        self.assertFalse(self.client._is_switch_product(68, "LIFX Candle C"))
+
+    def test_unknown_product_keeps_id(self):
+        self.assertEqual(
+            self.client._get_model_name(1, 99999),
+            "Unknown (product=99999)",
+        )
+
+
+class TestMultizonePackets(unittest.TestCase):
+    """Optional matrix/linear zone control packets."""
+
+    def setUp(self):
+        mock_sock = MagicMock()
+        mock_sock.getsockname.return_value = ('0.0.0.0', 12345)
+        mock_sock.recvfrom.side_effect = socket.timeout
+        with patch('socket.socket', return_value=mock_sock):
+            self.client = LifxLanClient(bind_ip="0.0.0.0")
+        self.client.listening = False
+        self.client.batch_running = False
+
+    def tearDown(self):
+        self.client.close()
+
+    def test_supercolour_tube_is_matrix(self):
+        from lifx_products import product_layout
+        self.assertEqual(product_layout(218), 'matrix')
+        light = LifxLight(b'\x00' * 8, '192.168.1.122')
+        light.layout = 'matrix'
+        light.zone_count = 52
+        self.assertTrue(light.zone_capable)
+
+    def test_supercolour_tube_zone_capable_from_product_without_layout(self):
+        light = LifxLight(b'\x00' * 8, '192.168.1.122')
+        light.product = 218
+        self.assertEqual(light.layout, 'single')
+        self.assertEqual(light.effective_layout, 'matrix')
+        self.assertTrue(light.zone_capable)
+        modes = self.client._get_supported_modes(218)
+        self.assertIn('RGB Full Pixel (8bit)', modes)
+        self.assertNotIn('HSBK (16bit)', modes)
+
+    def test_standard_bulb_not_zone_capable_from_product(self):
+        light = LifxLight(b'\x00' * 8, '192.168.1.50')
+        light.product = 27
+        self.assertFalse(light.zone_capable)
+        self.assertNotIn('RGB Full Pixel (8bit)', self.client._get_supported_modes(27))
+
+    def test_set64_packet_size_for_tube(self):
+        colors = [(100, 200, 300, 3500)] * 52
+        packets = self.client._build_set64_packets(b'\x01' * 8, colors, 4, 13, 20)
+        self.assertEqual(len(packets), 1)
+        self.assertEqual(len(packets[0]), lifx_client.HEADER_SIZE + 522)
+        msg_type = struct.unpack_from("<H", packets[0], 32)[0]
+        self.assertEqual(msg_type, lifx_client.SET_64)
+
+    def test_extended_multizone_packet_size(self):
+        colors = [(1, 2, 3, 3500)] * 10
+        packets = self.client._build_extended_mz_packets(b'\x02' * 8, colors, 20)
+        self.assertEqual(len(packets), 1)
+        self.assertEqual(len(packets[0]), lifx_client.HEADER_SIZE + 664)
+        apply_flag = packets[0][lifx_client.HEADER_SIZE + 4]
+        self.assertEqual(apply_flag, lifx_client.MULTI_ZONE_APPLY)
+
+    def test_parse_device_chain_sets_zone_count(self):
+        light = LifxLight(b'\x03' * 8, '192.168.1.10')
+        tile = bytearray(lifx_client.TILE_DEVICE_SIZE)
+        tile[16] = 4
+        tile[17] = 13
+        payload = bytes([0]) + bytes(tile) + bytes(lifx_client.TILE_DEVICE_SIZE * 15) + bytes([1])
+        self.client._parse_state_device_chain(light, b'\x00' * lifx_client.HEADER_SIZE + payload)
+        self.assertEqual(light.layout, 'matrix')
+        self.assertEqual(light.matrix_width, 4)
+        self.assertEqual(light.matrix_height, 13)
+        self.assertEqual(light.zone_count, 52)
+
+    def _header_payload(self, payload: bytes) -> bytes:
+        return b'\x00' * lifx_client.HEADER_SIZE + payload
+
+    def _set64_colors(self, packet: bytes, count: int):
+        offset = lifx_client.HEADER_SIZE + 10
+        colors = []
+        for i in range(count):
+            colors.append(struct.unpack_from("<HHHH", packet, offset + i * 8))
+        return colors
+
+    def test_parse_linear_zone_count_extended_uses_uint16_at_offset_zero(self):
+        light = LifxLight(b'\x04' * 8, '192.168.1.11')
+        # 300 = 0x012C little-endian; a 1-byte read would yield 0x2C (44).
+        payload = struct.pack("<HHB", 300, 0, 0)
+        self.client._parse_linear_zone_count(
+            light, lifx_client.STATE_EXTENDED_COLOR_ZONES, self._header_payload(payload)
+        )
+        self.assertEqual(light.layout, 'linear')
+        self.assertEqual(light.zone_count, 300)
+
+    def test_parse_linear_zone_count_extended_ignores_short_payload(self):
+        light = LifxLight(b'\x04' * 8, '192.168.1.11')
+        self.client._parse_linear_zone_count(
+            light, lifx_client.STATE_EXTENDED_COLOR_ZONES, self._header_payload(b'\x05')
+        )
+        self.assertEqual(light.layout, 'single')
+        self.assertEqual(light.zone_count, 1)
+
+    def test_parse_linear_zone_count_multizone_uses_first_byte(self):
+        light = LifxLight(b'\x05' * 8, '192.168.1.12')
+        payload = bytes([10, 2])  # uint16 read would be 522
+        self.client._parse_linear_zone_count(
+            light, lifx_client.STATE_MULTIZONE, self._header_payload(payload)
+        )
+        self.assertEqual(light.layout, 'linear')
+        self.assertEqual(light.zone_count, 10)
+
+    def test_parse_linear_zone_count_zone_uses_first_byte(self):
+        light = LifxLight(b'\x06' * 8, '192.168.1.13')
+        payload = bytes([8, 99])
+        self.client._parse_linear_zone_count(
+            light, lifx_client.STATE_ZONE, self._header_payload(payload)
+        )
+        self.assertEqual(light.layout, 'linear')
+        self.assertEqual(light.zone_count, 8)
+
+    def test_matrix_default_tile_dims_truncate_without_zone_count(self):
+        light = LifxLight(b'\x07' * 8, '192.168.1.14')
+        light.layout = 'matrix'
+        self.assertEqual(light.matrix_width, 1)
+        self.assertEqual(light.matrix_height, 1)
+        self.assertEqual(light.zone_count, 1)
+        colors = [(i * 10, 1, 2, 3500) for i in range(8)]
+        packets = self.client._zone_packets_for_light(light, colors, 20)
+        self.assertEqual(len(packets), 1)
+        packed = self._set64_colors(packets[0], 2)
+        self.assertEqual(packed[0], (0, 1, 2, 3500))
+        self.assertEqual(packed[1], (0, 0, 0, 0))
+
+    def test_matrix_default_tile_dims_keep_colours_when_zone_count_known(self):
+        light = LifxLight(b'\x08' * 8, '192.168.1.15')
+        light.layout = 'matrix'
+        light.zone_count = 8
+        colors = [(i * 10, 1, 2, 3500) for i in range(8)]
+        packets = self.client._zone_packets_for_light(light, colors, 20)
+        self.assertEqual(len(packets), 1)
+        packed = self._set64_colors(packets[0], 8)
+        self.assertEqual(packed, [(i * 10, 1, 2, 3500) for i in range(8)])
+
+    def test_supported_modes_come_from_exported_tuples(self):
+        from lifx_client import STANDARD_CHANNEL_MODES, ZONE_CHANNEL_MODES
+        self.assertEqual(
+            self.client._get_supported_modes(27),
+            list(STANDARD_CHANNEL_MODES),
+        )
+        self.assertEqual(
+            self.client._get_supported_modes(218),
+            [mode for mode in lifx_client.CHANNEL_MODES if mode in ZONE_CHANNEL_MODES],
+        )
 
 
 if __name__ == '__main__':

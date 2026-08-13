@@ -2,7 +2,7 @@ import sacn
 import threading
 import time
 import queue
-from typing import Dict, Callable, Optional
+from typing import Callable, Dict, List, Optional
 
 # Merge queued packet events into stats at most this often (bounded queue latency for UI)
 _STAT_DRAIN_INTERVAL_S = 0.05
@@ -16,6 +16,9 @@ class DMXReceiver:
         self.receiver = None
         self.universe_callbacks: Dict[int, Callable] = {}
         self.running = False
+        self._stopped = False
+        self._last_start_errors: List[Dict] = []
+        self._lifecycle_lock = threading.RLock()
         self.stats = {
             'packets_received': 0,
             'last_packet_time': None,
@@ -125,7 +128,7 @@ class DMXReceiver:
         # Register the listener using register_listener method (more reliable than decorator pattern)
         try:
             self.receiver.register_listener('universe', handle_dmx, universe=universe)
-        except Exception as e:
+        except TypeError as e:
             print(f"Error registering listener for universe {universe}: {e}")
             raise
         
@@ -136,43 +139,33 @@ class DMXReceiver:
             print(f"Error joining multicast for universe {universe}: {e}")
             # Continue anyway as unicast might still work
     
+    def _stats_snapshot_locked(self) -> Dict:
+        """Build a stats dict; caller must hold stats_lock (and should drain first)."""
+        self._drain_stat_queue_locked()
+        receiving = False
+        if self.stats['last_packet_time']:
+            receiving = (time.time() - self.stats['last_packet_time']) < 2.0 and self.running
+        return {
+            'packets_received': self.stats['packets_received'],
+            'last_packet_time': self.stats['last_packet_time'],
+            'active_universes': sorted(list(self.stats['active_universes'])),
+            'packets_per_universe': dict(self.stats['packets_per_universe']),
+            'running': self.running,
+            'receiving': receiving,
+            'last_start_errors': list(self._last_start_errors),
+        }
+
     def get_stats(self) -> Dict:
         """Get current reception statistics (drains pending packet events first)."""
         with self.stats_lock:
-            self._drain_stat_queue_locked()
-            receiving = False
-            if self.stats['last_packet_time']:
-                time_since_last = time.time() - self.stats['last_packet_time']
-                receiving = time_since_last < 2.0 and self.running
-            
-            return {
-                'packets_received': self.stats['packets_received'],
-                'last_packet_time': self.stats['last_packet_time'],
-                'active_universes': sorted(list(self.stats['active_universes'])),
-                'packets_per_universe': dict(self.stats['packets_per_universe']),
-                'running': self.running,
-                'receiving': receiving
-            }
+            return self._stats_snapshot_locked()
     
     def get_stats_nonblocking(self) -> Optional[Dict]:
         """Same as get_stats if the stats lock can be taken immediately; otherwise None."""
         if not self.stats_lock.acquire(blocking=False):
             return None
         try:
-            self._drain_stat_queue_locked()
-            receiving = False
-            if self.stats['last_packet_time']:
-                time_since_last = time.time() - self.stats['last_packet_time']
-                receiving = time_since_last < 2.0 and self.running
-            
-            return {
-                'packets_received': self.stats['packets_received'],
-                'last_packet_time': self.stats['last_packet_time'],
-                'active_universes': sorted(list(self.stats['active_universes'])),
-                'packets_per_universe': dict(self.stats['packets_per_universe']),
-                'running': self.running,
-                'receiving': receiving
-            }
+            return self._stats_snapshot_locked()
         finally:
             self.stats_lock.release()
     
@@ -193,14 +186,42 @@ class DMXReceiver:
     
     def start(self):
         """Start receiving DMX data"""
-        self.running = True
-        self._start_stat_drain_thread()
+        with self._lifecycle_lock:
+            if self._stopped:
+                self._last_start_errors = []
+                self._start_receiver()
+                for universe, callback in list(self.universe_callbacks.items()):
+                    try:
+                        self.listen_to_universe(universe, callback)
+                    except TypeError as e:
+                        print(f"Error re-registering listener for universe {universe}: {e}")
+                        self._last_start_errors.append({
+                            'universe': universe,
+                            'error': str(e),
+                        })
+                if self._last_start_errors:
+                    failed = [err['universe'] for err in self._last_start_errors]
+                    print(
+                        f"Degraded sACN startup: failed to re-register universes {failed}; "
+                        f"other universes remain listening"
+                    )
+            self._stopped = False
+            self.running = True
+            self._start_stat_drain_thread()
     
     def stop(self):
         """Stop receiving DMX data"""
-        self.running = False
-        self.receiver.stop()
-        self._stop_stat_drain_thread()
+        with self._lifecycle_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            self.running = False
+            if self.receiver is not None:
+                try:
+                    self.receiver.stop()
+                except Exception:
+                    pass
+            self._stop_stat_drain_thread()
     
     def close(self):
         """Close the receiver"""
