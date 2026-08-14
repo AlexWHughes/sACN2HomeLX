@@ -3,6 +3,7 @@ Unit tests for app.py - focusing on _restart_dmx_if_running function
 """
 import unittest
 from unittest.mock import Mock, MagicMock, patch, call
+from types import SimpleNamespace
 import threading
 import time
 import sys
@@ -338,6 +339,114 @@ class TestDmxU16Helpers(unittest.TestCase):
         self.assertEqual(app._dmx_u16(0x34, 0x12, True), 0x1234)
 
 
+class TestChannelModeSpec(unittest.TestCase):
+    def test_channel_counts(self):
+        self.assertEqual(app.CHANNELS_FOR_MODE, {
+            'RGB (8bit)': 3,
+            'RGB (16bit)': 6,
+            'RGB (16bit, fine first)': 6,
+            'RGB + Intensity (8bit)': 4,
+            'RGBW (8bit)': 4,
+            'RGBW (16bit)': 8,
+            'RGBW (16bit, fine first)': 8,
+            'HSBK (8bit)': 4,
+            'HSBK (16bit)': 8,
+            'HSBK (16bit, fine first)': 8,
+            'HSBK + Intensity (8bit)': 5,
+            'RGB Full Pixel (8bit)': 3,
+            'RGB + Intensity Full Pixel (8bit)': 4,
+            'RGBW Full Pixel (8bit)': 4,
+        })
+
+    def test_grouped_pixel_mode_is_pixel(self):
+        self.assertTrue(app._mode_is_pixel('RGB 8 Pixel (8bit)'))
+        self.assertEqual(app._channels_per_cell('RGB 8 Pixel (8bit)'), 3)
+        self.assertEqual(app._normalize_channel_mode('RGB 8 Pixel (8bit)'), 'RGB 8 Pixel (8bit)')
+
+    def test_unknown_mode_falls_back_to_rgb8(self):
+        self.assertEqual(app._normalize_channel_mode('nope'), 'RGB (8bit)')
+        self.assertEqual(app._normalize_channel_mode(None), 'RGB (8bit)')
+
+
+class TestDmxDecode(unittest.TestCase):
+    def test_rgb_8bit_full_red(self):
+        r, g, b, kelvin, duration, brightness = app._dmx_decode_to_cmd(
+            'RGB (8bit)', [255, 0, 0], 1.0
+        )
+        self.assertAlmostEqual(r, 1.0)
+        self.assertAlmostEqual(g, 0.0)
+        self.assertAlmostEqual(b, 0.0)
+        self.assertEqual(kelvin, app.DEFAULT_KELVIN)
+        self.assertEqual(duration, app.FADE_DURATION_MS)
+        self.assertEqual(brightness, 1.0)
+
+    def test_rgb_16bit_msb_first(self):
+        r, g, b, *_rest = app._dmx_decode_to_cmd(
+            'RGB (16bit)', [255, 255, 0, 0, 0, 0], 0.5
+        )
+        self.assertAlmostEqual(r, 1.0)
+        self.assertAlmostEqual(g, 0.0)
+        self.assertAlmostEqual(b, 0.0)
+
+    def test_rgb_16bit_fine_first_differs_from_msb(self):
+        values = [0x34, 0x12, 0, 0, 0, 0]
+        r_msb, *_a = app._dmx_decode_to_cmd('RGB (16bit)', values, 1.0)
+        r_fine, *_b = app._dmx_decode_to_cmd('RGB (16bit, fine first)', values, 1.0)
+        self.assertNotAlmostEqual(r_msb, r_fine)
+        self.assertAlmostEqual(r_fine, 0x1234 / 65535.0)
+
+    def test_rgb_plus_intensity(self):
+        r, g, b, *_rest = app._dmx_decode_to_cmd(
+            'RGB + Intensity (8bit)', [255, 255, 255, 128], 1.0
+        )
+        self.assertAlmostEqual(r, 128 / 255.0, places=5)
+        self.assertAlmostEqual(g, 128 / 255.0, places=5)
+        self.assertAlmostEqual(b, 128 / 255.0, places=5)
+
+    def test_rgbw_blends_white(self):
+        r, g, b, *_rest = app._dmx_decode_to_cmd(
+            'RGBW (8bit)', [255, 0, 0, 255], 1.0
+        )
+        self.assertAlmostEqual(r, 1.0)
+        self.assertAlmostEqual(g, app.BLEND_WHITE_COEFF)
+        self.assertAlmostEqual(b, app.BLEND_WHITE_COEFF)
+
+    def test_hsbk_8bit_full_value_white(self):
+        r, g, b, kelvin, _duration, brightness = app._dmx_decode_to_cmd(
+            'HSBK (8bit)', [0, 0, 255, 0], 1.0
+        )
+        self.assertAlmostEqual(r, 1.0)
+        self.assertAlmostEqual(g, 1.0)
+        self.assertAlmostEqual(b, 1.0)
+        self.assertEqual(kelvin, 2500)
+        self.assertAlmostEqual(brightness, 1.0)
+
+    def test_hsbk_intensity_scales_brightness(self):
+        *_rgb, _kelvin, _duration, brightness = app._dmx_decode_to_cmd(
+            'HSBK + Intensity (8bit)', [0, 0, 255, 0, 128], 1.0
+        )
+        self.assertAlmostEqual(brightness, 128 / 255.0, places=5)
+
+    def test_8bit_change_threshold(self):
+        self.assertFalse(app._dmx_values_changed('RGB (8bit)', [10, 10, 10], [10, 10, 10]))
+        self.assertTrue(app._dmx_values_changed('RGB (8bit)', [11, 10, 10], [10, 10, 10]))
+
+    def test_16bit_change_uses_combined_value(self):
+        prev = [0x12, 0x34, 0, 0, 0, 0]
+        same = [0x12, 0x34, 0, 0, 0, 0]
+        changed = [0x12, 0x35, 0, 0, 0, 0]
+        self.assertFalse(app._dmx_values_changed('RGB (16bit)', same, prev))
+        self.assertTrue(app._dmx_values_changed('RGB (16bit)', changed, prev))
+
+    def test_16bit_truncated_last_values_falls_back_to_per_byte(self):
+        same = [0x12, 0x34, 0]
+        prev = [0x12, 0x34, 0]
+        changed = [0x12, 0x35, 0]
+        self.assertFalse(app._dmx_values_changed('RGB (16bit)', same, prev))
+        self.assertTrue(app._dmx_values_changed('RGB (16bit)', changed, prev))
+        self.assertTrue(app._dmx_values_changed('RGB (16bit)', [10, 10, 10, 10, 10, 10], [10, 10]))
+
+
 class TestListLightsApi(unittest.TestCase):
     """GET /api/lights returns configured and unconfigured lists"""
 
@@ -347,13 +456,16 @@ class TestListLightsApi(unittest.TestCase):
         self.client = self.flask_app.test_client()
         self._saved_mappings = dict(app.light_mappings)
         self._saved_client = app.lifx_client
+        app._dmx_mapping_cache_dirty = True
 
     def tearDown(self):
         app.light_mappings = self._saved_mappings
         app.lifx_client = self._saved_client
+        app._dmx_mapping_cache_dirty = True
 
     def test_list_lights_no_client_empty_mappings(self):
         app.light_mappings = {}
+        app._dmx_mapping_cache_dirty = True
         app.lifx_client = None
         resp = self.client.get('/api/lights')
         self.assertEqual(resp.status_code, 200)
@@ -375,6 +487,7 @@ class TestListLightsApi(unittest.TestCase):
                 'model': 'LIFX Color',
             }
         }
+        app._dmx_mapping_cache_dirty = True
         resp = self.client.get('/api/lights')
         data = resp.get_json()
         self.assertTrue(data['success'])
@@ -383,6 +496,111 @@ class TestListLightsApi(unittest.TestCase):
         self.assertFalse(row['discovered'])
         self.assertEqual(row['label'], 'Stage Left')
         self.assertEqual(row['mapping']['channel_mode'], 'HSBK (16bit)')
+
+    def test_list_lights_prefers_mapping_label_over_device_label(self):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+        light.label = 'LIFX Colour'
+        light.model_name = 'LIFX Color'
+        lid = app.light_id(light)
+        mock_client = Mock()
+        mock_client.get_lights.return_value = [light]
+        mock_client.lights = {light.target: light}
+        mock_client.lock = threading.Lock()
+        app.lifx_client = mock_client
+        app.light_mappings = {
+            lid: {
+                'universe': 1,
+                'start_channel': 1,
+                'brightness': 1.0,
+                'channel_mode': 'RGB (8bit)',
+                'label': 'Stage Wash',
+                'model': 'LIFX Color',
+                'ip': '192.168.1.50',
+            }
+        }
+        app._dmx_mapping_cache_dirty = True
+        resp = self.client.get('/api/lights')
+        row = resp.get_json()['all_configured_lights'][0]
+        self.assertEqual(row['label'], 'Stage Wash')
+        self.assertEqual(row['mapping']['label'], 'Stage Wash')
+
+    def test_list_lights_supercolour_shows_pixel_modes(self):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5a29dd40000'), '192.168.1.122')
+        light.product = 218
+        light.model_name = 'LIFX SuperColour Tube'
+        light.label = 'Living Room Forest Lamp'
+        light.layout = 'matrix'
+        light.zone_count = 55
+        light.matrix_width = 5
+        light.matrix_height = 11
+        mock_client = Mock()
+        mock_client.get_lights.return_value = [light]
+        mock_client.lights = {light.target: light}
+        mock_client.lock = threading.Lock()
+        app.lifx_client = mock_client
+        app.light_mappings = {}
+        app._dmx_mapping_cache_dirty = True
+        resp = self.client.get('/api/lights')
+        data = resp.get_json()
+        self.assertEqual(len(data['unconfigured_lights']), 1)
+        row = data['unconfigured_lights'][0]
+        self.assertEqual(row['model'], 'LIFX SuperColour Tube')
+        self.assertTrue(row['zone_capable'])
+        self.assertEqual(row['zone_layout'], 'matrix')
+        self.assertIn('RGB Full Pixel (8bit)', row['supported_modes'])
+        self.assertIn('RGB 8 Pixel (8bit)', row['supported_modes'])
+        self.assertIn('RGB 11 Pixel (8bit)', row['supported_modes'])
+        self.assertNotIn('HSBK (16bit)', row['supported_modes'])
+        labels = {opt['value']: opt['label'] for opt in row['mode_options']}
+        self.assertEqual(labels['RGB Full Pixel (8bit)'], 'RGB Full Pixel (8bit) — 165 ch')
+        self.assertEqual(labels['RGB 8 Pixel (8bit)'], 'RGB 8 Pixel (8bit) — 24 ch')
+        pattern_ids = [item['id'] for item in row['pixel_test_patterns']]
+        self.assertEqual(pattern_ids[0], 'rainbow')
+        self.assertIn('chase', pattern_ids)
+
+
+class TestGetNetworkInterfaces(unittest.TestCase):
+    """Interface listing via ifaddr, with socket fallback."""
+
+    def test_ifaddr_keeps_ipv4_and_skips_loopback_and_ipv6(self):
+        adapters = [
+            SimpleNamespace(
+                name='lo0',
+                nice_name='lo0',
+                ips=[SimpleNamespace(ip='127.0.0.1')],
+            ),
+            SimpleNamespace(
+                name='en0',
+                nice_name='en0',
+                ips=[
+                    SimpleNamespace(ip=('fe80::1', 0, 14)),
+                    SimpleNamespace(ip='192.168.1.82'),
+                    SimpleNamespace(ip='192.168.1.82'),
+                ],
+            ),
+        ]
+        mock_ifaddr = SimpleNamespace(get_adapters=lambda: adapters)
+        with patch.object(app, 'ifaddr', mock_ifaddr):
+            result = app.get_network_interfaces()
+
+        ips = [row['ip'] for row in result]
+        self.assertEqual(result[0]['ip'], '0.0.0.0')
+        self.assertEqual(ips.count('192.168.1.82'), 1)
+        self.assertNotIn('127.0.0.1', ips)
+        self.assertEqual(result[1]['display'], 'en0 (192.168.1.82)')
+
+    def test_socket_fallback_when_ifaddr_missing(self):
+        addrinfo = [(None, None, None, None, ('10.0.0.5', 0))]
+        with patch.object(app, 'ifaddr', None), \
+             patch('app.socket.gethostname', return_value='testhost'), \
+             patch('app.socket.getaddrinfo', return_value=addrinfo):
+            result = app.get_network_interfaces()
+
+        self.assertEqual(result[0]['ip'], '0.0.0.0')
+        self.assertEqual(result[1]['ip'], '10.0.0.5')
+        self.assertEqual(result[1]['display'], 'testhost (10.0.0.5)')
 
 
 class TestNormalizeInterfaceIp(unittest.TestCase):
@@ -413,6 +631,581 @@ class TestNormalizeInterfaceIp(unittest.TestCase):
         """Test that empty string returns 0.0.0.0"""
         result = app._normalize_interface_ip('')
         self.assertEqual(result, '0.0.0.0')
+
+
+class TestPixelMapping(unittest.TestCase):
+    """Pixel and grouped SuperColour DMX modes."""
+
+    def test_zone_count_defaults_to_one(self):
+        mapping = {'channel_mode': 'RGB (8bit)'}
+        self.assertEqual(app._mapping_zone_count(mapping, None), 1)
+        self.assertEqual(app._mapping_channels_needed(mapping, None), 3)
+
+    def test_whole_fixture_ignores_zone_count(self):
+        from lifx_client import LifxLight
+        light = LifxLight(b'\x00' * 8, '192.168.1.122')
+        light.zone_count = 52
+        mapping = {'channel_mode': 'RGB (8bit)'}
+        self.assertEqual(app._mapping_channels_needed(mapping, light), 3)
+
+    def test_full_pixel_uses_physical_zone_count(self):
+        from lifx_client import LifxLight
+        light = LifxLight(b'\x00' * 8, '192.168.1.122')
+        light.layout = 'matrix'
+        light.zone_count = 55
+        mapping = {'channel_mode': 'RGB Full Pixel (8bit)'}
+        self.assertEqual(app._mapping_zone_count(mapping, light), 55)
+        self.assertEqual(app._mapping_channels_needed(mapping, light), 165)
+
+    def test_grouped_pixel_mode_uses_control_cells(self):
+        from lifx_client import LifxLight
+        light = LifxLight(b'\x00' * 8, '192.168.1.122')
+        light.layout = 'matrix'
+        light.zone_count = 55
+        light.matrix_width = 5
+        light.matrix_height = 11
+        mapping = {'channel_mode': 'RGB 8 Pixel (8bit)'}
+        self.assertEqual(app._mapping_zone_count(mapping, light), 8)
+        self.assertEqual(app._mapping_channels_needed(mapping, light), 24)
+        self.assertEqual(app._physical_zone_count(mapping, light), 55)
+
+    def test_zone_fixture_gets_pixel_mode_options(self):
+        from lifx_client import LifxLight
+        light = LifxLight(b'\x00' * 8, '192.168.1.122')
+        light.layout = 'matrix'
+        light.zone_count = 55
+        light.matrix_width = 5
+        light.matrix_height = 11
+        modes = app._supported_modes_for(light)
+        self.assertIn('RGB Full Pixel (8bit)', modes)
+        self.assertIn('RGBW Full Pixel (8bit)', modes)
+        self.assertIn('RGB + Intensity Full Pixel (8bit)', modes)
+        self.assertIn('RGB 11 Pixel (8bit)', modes)
+        self.assertIn('RGB 8 Pixel (8bit)', modes)
+        self.assertIn('RGB 5 Pixel (8bit)', modes)
+        self.assertIn('RGB 4 Pixel (8bit)', modes)
+        self.assertIn('RGB 2 Pixel (8bit)', modes)
+        self.assertNotIn('HSBK (16bit)', modes)
+        labels = {opt['value']: opt['label'] for opt in app._mode_options_for(light)}
+        self.assertEqual(labels['RGB Full Pixel (8bit)'], 'RGB Full Pixel (8bit) — 165 ch')
+        self.assertEqual(labels['RGB 8 Pixel (8bit)'], 'RGB 8 Pixel (8bit) — 24 ch')
+
+    def test_standard_fixture_does_not_get_pixel_modes(self):
+        from lifx_client import LifxLight
+        light = LifxLight(b'\x00' * 8, '192.168.1.50')
+        self.assertNotIn('RGB Full Pixel (8bit)', app._supported_modes_for(light))
+        self.assertNotIn('RGB 8 Pixel (8bit)', app._supported_modes_for(light))
+
+    def test_supercolour_product_gets_pixel_modes_without_layout(self):
+        from lifx_client import LifxLight
+        light = LifxLight(b'\x00' * 8, '192.168.1.122')
+        light.product = 218
+        light.model_name = 'LIFX SuperColour Tube'
+        modes = app._supported_modes_for(light)
+        self.assertIn('RGB Full Pixel (8bit)', modes)
+        self.assertIn('RGBW Full Pixel (8bit)', modes)
+        self.assertNotIn('HSBK (16bit)', modes)
+        fields = app._light_zone_fields(light)
+        self.assertTrue(fields['zone_capable'])
+        self.assertEqual(fields['zone_layout'], 'matrix')
+
+    def test_offline_mapping_uses_stored_layout_not_model_name(self):
+        mapping = {
+            'model': 'LIFX SuperColour Tube',
+            'channel_mode': 'RGB (8bit)',
+            'ip': '192.168.1.122',
+        }
+        modes = app._supported_modes_for(None, mapping)
+        self.assertNotIn('RGB Full Pixel (8bit)', modes)
+        self.assertFalse(app._mapping_is_zone_capable(mapping))
+
+        stored = dict(mapping)
+        stored.update({
+            'zone_capable': True,
+            'zone_count': 55,
+            'zone_layout': 'matrix',
+        })
+        modes = app._supported_modes_for(None, stored)
+        self.assertIn('RGB Full Pixel (8bit)', modes)
+        self.assertNotIn('HSBK (16bit)', modes)
+        self.assertTrue(app._mapping_is_zone_capable(stored))
+
+    def test_expand_rows_and_columns_for_5x11(self):
+        rows = [(i, 0, 0, 3500, 1.0) for i in range(11)]
+        row_out = app._expand_control_cells_to_zones(rows, 55, 5, 11)
+        self.assertEqual(len(row_out), 55)
+        self.assertEqual(row_out[0], rows[0])
+        self.assertEqual(row_out[4], rows[0])
+        self.assertEqual(row_out[5], rows[1])
+        cols = [(i, 0, 0, 3500, 1.0) for i in range(5)]
+        col_out = app._expand_control_cells_to_zones(cols, 55, 5, 11)
+        self.assertEqual(col_out[0], cols[0])
+        self.assertEqual(col_out[1], cols[1])
+        self.assertEqual(col_out[5], cols[0])
+
+    def test_expand_eight_cells_covers_all_pixels(self):
+        cells = [(i, 0, 0, 3500, 1.0) for i in range(8)]
+        out = app._expand_control_cells_to_zones(cells, 55, 5, 11)
+        self.assertEqual(len(out), 55)
+        self.assertEqual(out[0], cells[0])
+        self.assertEqual(out[-1], cells[7])
+
+    def test_pixel_test_patterns_for_tube(self):
+        from lifx_client import LifxLight
+        light = LifxLight(b'\x00' * 8, '192.168.1.122')
+        light.layout = 'matrix'
+        light.zone_count = 55
+        light.matrix_width = 5
+        light.matrix_height = 11
+        ids = [row['id'] for row in app._pixel_test_patterns(light)]
+        self.assertEqual(ids, ['rainbow', 'rows', 'columns', '8', '4', '2', 'chase'])
+
+    def test_pixel_test_rainbow_and_rows(self):
+        from lifx_client import LifxLight
+        light = LifxLight(b'\x00' * 8, '192.168.1.122')
+        light.layout = 'matrix'
+        light.zone_count = 55
+        light.matrix_width = 5
+        light.matrix_height = 11
+        rainbow = app._pixel_test_commands(light, 'rainbow', 1.0)
+        self.assertEqual(len(rainbow), 55)
+        self.assertNotEqual(rainbow[0][:3], rainbow[-1][:3])
+        rows = app._pixel_test_commands(light, 'rows', 1.0)
+        self.assertEqual(rows[0][:3], rows[4][:3])
+        self.assertNotEqual(rows[0][:3], rows[5][:3])
+        cols = app._pixel_test_commands(light, 'columns', 1.0)
+        self.assertEqual(cols[0][:3], cols[5][:3])
+        self.assertNotEqual(cols[0][:3], cols[1][:3])
+        grouped = app._pixel_test_commands(light, '8', 1.0)
+        self.assertEqual(len(grouped), 55)
+        chase = app._pixel_test_commands(light, 'chase', 1.0, chase_index=3, chase_rgb=(1.0, 0.0, 0.0))
+        self.assertEqual(chase[3][:3], (1.0, 0.0, 0.0))
+        self.assertEqual(chase[0][:3], (0.0, 0.0, 0.0))
+
+    def test_standard_fixture_has_no_pixel_tests(self):
+        from lifx_client import LifxLight
+        light = LifxLight(b'\x00' * 8, '192.168.1.50')
+        self.assertEqual(app._pixel_test_patterns(light), [])
+
+    def test_pixel_test_commands_use_mapping_geometry(self):
+        from lifx_client import LifxLight
+        light = LifxLight(b'\x00' * 8, '192.168.1.122')
+        light.product = 218
+        light.model_name = 'LIFX SuperColour Tube'
+        mapping = {
+            'zone_capable': True,
+            'zone_count': 55,
+            'zone_layout': 'matrix',
+            'matrix_width': 5,
+            'matrix_height': 11,
+        }
+        ids = [row['id'] for row in app._pixel_test_patterns(light, mapping)]
+        self.assertEqual(ids, ['rainbow', 'rows', 'columns', '8', '4', '2', 'chase'])
+        self.assertEqual(app._pixel_test_commands(light, 'rainbow', 1.0), [])
+        rainbow = app._pixel_test_commands(light, 'rainbow', 1.0, mapping=mapping)
+        self.assertEqual(len(rainbow), 55)
+
+
+class TestGetInterfaces(unittest.TestCase):
+    def setUp(self):
+        self.flask_app = app.app
+        self.flask_app.config['TESTING'] = True
+        self.client = self.flask_app.test_client()
+        self._cache = app._interfaces_cache
+        self._cache_time = app._interfaces_cache_time
+        self._in_flight = app._interfaces_refresh_in_flight
+        app._interfaces_cache = None
+        app._interfaces_cache_time = 0
+        app._interfaces_refresh_in_flight = False
+
+    def tearDown(self):
+        app._interfaces_cache = self._cache
+        app._interfaces_cache_time = self._cache_time
+        app._interfaces_refresh_in_flight = self._in_flight
+
+    @patch('app.get_network_interfaces', return_value=[{'ip': '192.168.1.82', 'display': 'en0 (192.168.1.82)'}])
+    def test_cold_start_does_not_raise_unbound_local(self, _mock_ifaces):
+        resp = self.client.get('/api/interfaces')
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(len(data['interfaces']), 1)
+
+    @patch('app.get_network_interfaces', return_value=[{'ip': '192.168.1.82', 'display': 'en0 (192.168.1.82)'}])
+    def test_stale_cache_background_refresh_does_not_raise(self, _mock_ifaces):
+        app._interfaces_cache = [{'ip': '10.0.0.1', 'display': 'stale'}]
+        app._interfaces_cache_time = 0
+        resp = self.client.get('/api/interfaces')
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data['success'])
+        deadline = time.time() + 2.0
+        while app._interfaces_refresh_in_flight and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(
+            app._interfaces_refresh_in_flight,
+            'background interface refresh did not finish before deadline',
+        )
+
+
+class TestTestRgbApi(unittest.TestCase):
+    def setUp(self):
+        self.flask_app = app.app
+        self.flask_app.config['TESTING'] = True
+        self.client = self.flask_app.test_client()
+        self._saved_client = app.lifx_client
+        with app._batch_lock:
+            self._saved_batch = dict(app._batch_commands_by_id)
+            app._batch_commands_by_id.clear()
+
+    def tearDown(self):
+        app._stop_lifx_batch_sender_thread()
+        app.lifx_client = self._saved_client
+        with app._batch_lock:
+            app._batch_commands_by_id.clear()
+            app._batch_commands_by_id.update(self._saved_batch)
+
+    def _mock_light(self):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.10')
+        light.label = 'Test Lamp'
+        mock_client = Mock()
+        mock_client.get_lights.return_value = [light]
+        mock_client.lights = {light.target: light}
+        mock_client.lock = threading.Lock()
+        mock_client.executor = Mock()
+        app.lifx_client = mock_client
+        return light, mock_client
+
+    @patch('app._start_lifx_batch_sender_thread')
+    def test_test_rgb_coalesces_latest_color_without_blocking(self, _mock_start):
+        light, mock_client = self._mock_light()
+        lid = app.light_id(light)
+        first = self.client.post('/api/lights/test-rgb', json={
+            'light_id': lid, 'r': 1, 'g': 2, 'b': 3, 'brightness': 1.0,
+        })
+        second = self.client.post('/api/lights/test-rgb', json={
+            'light_id': lid, 'r': 10, 'g': 20, 'b': 30, 'brightness': 0.5,
+        })
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(first.get_json()['success'])
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.get_json()['success'])
+        mock_client.executor.submit.assert_not_called()
+        self.assertEqual(len(app._batch_commands_by_id), 1)
+        cmd = app._batch_commands_by_id[lid]
+        self.assertEqual(cmd[0], 'color')
+        self.assertAlmostEqual(cmd[2], 10 / 255.0)
+        self.assertAlmostEqual(cmd[3], 20 / 255.0)
+        self.assertAlmostEqual(cmd[4], 30 / 255.0)
+        self.assertAlmostEqual(cmd[7], 0.5)
+
+    def test_test_rgb_missing_light_keeps_error_contract(self):
+        _light, mock_client = self._mock_light()
+        resp = self.client.post('/api/lights/test-rgb', json={
+            'light_id': 'missing', 'r': 1, 'g': 2, 'b': 3,
+        })
+        self.assertEqual(resp.status_code, 404)
+        data = resp.get_json()
+        self.assertFalse(data['success'])
+        self.assertEqual(data['error'], 'Light not found')
+        mock_client.executor.submit.assert_not_called()
+
+    def test_test_rgb_rejects_invalid_fade_ms(self):
+        light, mock_client = self._mock_light()
+        lid = app.light_id(light)
+        resp = self.client.post('/api/lights/test-rgb', json={
+            'light_id': lid, 'r': 1, 'g': 2, 'b': 3, 'brightness': 1.0, 'fade_ms': 45.5,
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()['success'])
+        mock_client.executor.submit.assert_not_called()
+        self.assertEqual(app._batch_commands_by_id, {})
+
+
+class TestUpdateMappingChannelMode(unittest.TestCase):
+    def setUp(self):
+        self.flask_app = app.app
+        self.flask_app.config['TESTING'] = True
+        self.client = self.flask_app.test_client()
+        self._saved_mappings = dict(app.light_mappings)
+        self._saved_client = app.lifx_client
+        app.light_mappings = {}
+        app.lifx_client = None
+        app._dmx_mapping_cache_dirty = True
+
+    def tearDown(self):
+        app.light_mappings = self._saved_mappings
+        app.lifx_client = self._saved_client
+        app._dmx_mapping_cache_dirty = True
+
+    @patch('app._restart_dmx_if_running')
+    @patch('app.save_config')
+    def test_rejects_pixel_mode_for_standard_fixture(self, _save, _restart):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+        light.label = 'Bulb'
+        light.model_name = 'LIFX Color'
+        lid = app.light_id(light)
+        mock_client = Mock()
+        mock_client.get_lights.return_value = [light]
+        app.lifx_client = mock_client
+        app.light_mappings[lid] = {
+            'universe': 1,
+            'start_channel': 1,
+            'brightness': 1.0,
+            'channel_mode': 'HSBK (8bit)',
+            'label': 'Bulb',
+            'model': 'LIFX Color',
+            'ip': '192.168.1.50',
+        }
+        resp = self.client.post('/api/mappings', json={
+            'light_id': lid,
+            'universe': 1,
+            'start_channel': 1,
+            'channel_mode': 'RGB Full Pixel (8bit)',
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()['mapping']['channel_mode'], 'HSBK (8bit)')
+
+    @patch('app._restart_dmx_if_running')
+    @patch('app.save_config')
+    def test_keeps_valid_pixel_mode_for_zone_fixture(self, _save, _restart):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.122')
+        light.layout = 'matrix'
+        light.zone_count = 55
+        light.matrix_width = 5
+        light.matrix_height = 11
+        light.label = 'Tube'
+        lid = app.light_id(light)
+        mock_client = Mock()
+        mock_client.get_lights.return_value = [light]
+        app.lifx_client = mock_client
+        resp = self.client.post('/api/mappings', json={
+            'light_id': lid,
+            'universe': 2,
+            'start_channel': 10,
+            'channel_mode': 'RGB 8 Pixel (8bit)',
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()['mapping']['channel_mode'], 'RGB 8 Pixel (8bit)')
+
+    @patch('app._restart_dmx_if_running')
+    @patch('app.save_config')
+    def test_rename_keeps_custom_label_when_device_is_discovered(self, _save, _restart):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+        light.label = 'LIFX Colour'
+        light.model_name = 'LIFX Color'
+        lid = app.light_id(light)
+        mock_client = Mock()
+        mock_client.get_lights.return_value = [light]
+        app.lifx_client = mock_client
+        app.light_mappings[lid] = {
+            'universe': 1,
+            'start_channel': 1,
+            'brightness': 1.0,
+            'channel_mode': 'RGB (8bit)',
+            'label': 'LIFX Colour',
+            'model': 'LIFX Color',
+            'ip': '192.168.1.50',
+        }
+        resp = self.client.post('/api/mappings', json={
+            'light_id': lid,
+            'universe': 1,
+            'start_channel': 1,
+            'channel_mode': 'RGB (8bit)',
+            'label': 'Stage Wash',
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()['mapping']['label'], 'Stage Wash')
+        row = app._configured_light_row(lid, app.light_mappings[lid], light)
+        self.assertEqual(row['label'], 'Stage Wash')
+        resp = self.client.post('/api/mappings', json={
+            'light_id': lid,
+            'universe': 1,
+            'start_channel': 1,
+            'channel_mode': 'RGB (8bit)',
+        })
+        self.assertEqual(resp.get_json()['mapping']['label'], 'Stage Wash')
+
+
+class TestTestPixelsValidation(unittest.TestCase):
+    def setUp(self):
+        self.flask_app = app.app
+        self.flask_app.config['TESTING'] = True
+        self.client = self.flask_app.test_client()
+        self._saved_client = app.lifx_client
+        mock_client = Mock()
+        mock_client.get_lights.return_value = []
+        mock_client.lights = {}
+        mock_client.lock = threading.Lock()
+        app.lifx_client = mock_client
+
+    def tearDown(self):
+        app.lifx_client = self._saved_client
+
+    def test_invalid_brightness_returns_400(self):
+        resp = self.client.post('/api/lights/test-pixels', json={
+            'light_id': 'abc', 'pattern': 'rainbow', 'brightness': 'bright',
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()['error'], 'Brightness must be 0.0-1.0')
+
+    def test_invalid_fade_ms_returns_400(self):
+        resp = self.client.post('/api/lights/test-pixels', json={
+            'light_id': 'abc', 'pattern': 'rainbow', 'fade_ms': 'slow',
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('fade_ms', resp.get_json()['error'])
+
+    def test_numeric_strings_are_accepted_before_light_lookup(self):
+        resp = self.client.post('/api/lights/test-pixels', json={
+            'light_id': 'missing', 'pattern': 'rainbow',
+            'brightness': '0.5', 'fade_ms': '45',
+        })
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.get_json()['error'], 'Light not found')
+
+    def test_fade_ms_rejects_non_integral_and_non_finite(self):
+        self.assertIsNone(app._coerce_fade_ms(45.5))
+        self.assertIsNone(app._coerce_fade_ms(float('inf')))
+        self.assertIsNone(app._coerce_fade_ms(float('nan')))
+        self.assertIsNone(app._coerce_fade_ms(0xFFFFFFFF + 1))
+        self.assertEqual(app._coerce_fade_ms('45'), 45)
+        self.assertEqual(app._coerce_fade_ms(45.0), 45)
+        self.assertEqual(app._coerce_fade_ms(0), 0)
+        self.assertEqual(app._coerce_fade_ms(0xFFFFFFFF), 0xFFFFFFFF)
+
+    def test_non_integral_fade_ms_returns_400(self):
+        resp = self.client.post('/api/lights/test-pixels', json={
+            'light_id': 'abc', 'pattern': 'rainbow', 'fade_ms': 45.5,
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('fade_ms', resp.get_json()['error'])
+
+
+class TestErrorOnlyRequestHandler(unittest.TestCase):
+    def test_unparsable_status_delegates(self):
+        with patch.object(app.WSGIRequestHandler, 'log_request') as parent:
+            handler = app._ErrorOnlyRequestHandler.__new__(app._ErrorOnlyRequestHandler)
+            handler.log_request('-', '-')
+            parent.assert_called_once_with('-', '-')
+
+    def test_success_status_is_silent(self):
+        with patch.object(app.WSGIRequestHandler, 'log_request') as parent:
+            handler = app._ErrorOnlyRequestHandler.__new__(app._ErrorOnlyRequestHandler)
+            handler.log_request(200, '12')
+            parent.assert_not_called()
+
+    def test_error_status_delegates(self):
+        with patch.object(app.WSGIRequestHandler, 'log_request') as parent:
+            handler = app._ErrorOnlyRequestHandler.__new__(app._ErrorOnlyRequestHandler)
+            handler.log_request(404, '12')
+            parent.assert_called_once_with(404, '12')
+
+
+class TestMetricsUtilization(unittest.TestCase):
+    def setUp(self):
+        self.flask_app = app.app
+        self.flask_app.config['TESTING'] = True
+        self.client = self.flask_app.test_client()
+        self._metrics = dict(app._perf_metrics)
+        self._peak = app._perf_metrics['peak_fixtures_per_frame']
+        self._avg = app._perf_metrics['avg_batch_size']
+        self._batch_sizes = list(app._perf_metrics['batch_sizes'])
+
+    def tearDown(self):
+        app._perf_metrics['peak_fixtures_per_frame'] = self._peak
+        app._perf_metrics['avg_batch_size'] = self._avg
+        app._perf_metrics['total_batches_sent'] = self._metrics['total_batches_sent']
+        app._perf_metrics['batch_sizes'].clear()
+        app._perf_metrics['batch_sizes'].extend(self._batch_sizes)
+
+    def test_batch_utilization_uses_peak_capacity(self):
+        with app._perf_lock:
+            app._perf_metrics['batch_sizes'].clear()
+            app._perf_metrics['batch_sizes'].extend([8, 2, 2])
+            app._perf_metrics['avg_batch_size'] = 4
+            app._perf_metrics['peak_fixtures_per_frame'] = 99
+            app._perf_metrics['total_batches_sent'] = 10
+        data = self.client.get('/api/metrics').get_json()
+        self.assertTrue(data['success'])
+        self.assertAlmostEqual(data['metrics']['batch_efficiency'], 0.5)
+        self.assertAlmostEqual(data['metrics']['batch_utilization_percent'], 50.0)
+        self.assertIn('current_queue_size', data['metrics'])
+        self.assertIn('last_drain_duration_s', data['metrics'])
+        self.assertIn('peak_drain_duration_s', data['metrics'])
+        self.assertIn('drain_overrun_count', data['metrics'])
+
+    def test_batch_utilization_zero_without_peak_capacity(self):
+        with app._perf_lock:
+            app._perf_metrics['batch_sizes'].clear()
+            app._perf_metrics['peak_fixtures_per_frame'] = 0
+            app._perf_metrics['avg_batch_size'] = 3
+            app._perf_metrics['total_batches_sent'] = 5
+        data = self.client.get('/api/metrics').get_json()
+        self.assertEqual(data['metrics']['batch_efficiency'], 0.0)
+        self.assertEqual(data['metrics']['batch_utilization_percent'], 0.0)
+
+
+class TestBatchDrainDuration(unittest.TestCase):
+    def setUp(self):
+        self._saved_client = app.lifx_client
+        self._last_batch = app._last_batch_time
+        with app._perf_lock:
+            self._overrun = app._perf_metrics['drain_overrun_count']
+            self._last_drain = app._perf_metrics['last_drain_duration_s']
+            self._peak = app._perf_metrics['peak_drain_duration_s']
+            self._batches_sent = app._perf_metrics['total_batches_sent']
+            self._commands_sent = app._perf_metrics['total_commands_sent']
+            self._batch_sizes = list(app._perf_metrics['batch_sizes'])
+            self._avg = app._perf_metrics['avg_batch_size']
+        with app._batch_lock:
+            self._saved_batch = dict(app._batch_commands_by_id)
+            app._batch_commands_by_id.clear()
+
+    def tearDown(self):
+        app.lifx_client = self._saved_client
+        app._last_batch_time = self._last_batch
+        with app._perf_lock:
+            app._perf_metrics['drain_overrun_count'] = self._overrun
+            app._perf_metrics['last_drain_duration_s'] = self._last_drain
+            app._perf_metrics['peak_drain_duration_s'] = self._peak
+            app._perf_metrics['total_batches_sent'] = self._batches_sent
+            app._perf_metrics['total_commands_sent'] = self._commands_sent
+            app._perf_metrics['avg_batch_size'] = self._avg
+            app._perf_metrics['batch_sizes'].clear()
+            app._perf_metrics['batch_sizes'].extend(self._batch_sizes)
+        with app._batch_lock:
+            app._batch_commands_by_id.clear()
+            app._batch_commands_by_id.update(self._saved_batch)
+
+    def test_records_drain_duration_when_send_exceeds_interval(self):
+        clock = {'t': 1000.0}
+        light = SimpleNamespace(target=b'\x01' * 8, ip='192.168.1.10', label='Lamp')
+        mock_client = Mock()
+
+        def send(*_args, **_kwargs):
+            clock['t'] += 0.05
+
+        mock_client.send_color_now.side_effect = send
+        app.lifx_client = mock_client
+        app._last_batch_time = 0
+        with app._batch_lock:
+            app._batch_commands_by_id['lamp'] = (
+                'color', light, 1.0, 0.0, 0.0, 3500, 45, 1.0,
+            )
+        with patch('app.time.time', side_effect=lambda: clock['t']):
+            app._lifx_send_one_batch()
+        mock_client.send_color_now.assert_called_once()
+        self.assertAlmostEqual(app._perf_metrics['last_drain_duration_s'], 0.05)
+        self.assertGreaterEqual(
+            app._perf_metrics['peak_drain_duration_s'],
+            app._perf_metrics['last_drain_duration_s'],
+        )
+        self.assertEqual(app._perf_metrics['drain_overrun_count'], self._overrun + 1)
 
 
 if __name__ == '__main__':
