@@ -497,6 +497,34 @@ class TestListLightsApi(unittest.TestCase):
         self.assertEqual(row['label'], 'Stage Left')
         self.assertEqual(row['mapping']['channel_mode'], 'HSBK (16bit)')
 
+    def test_list_lights_prefers_mapping_label_over_device_label(self):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+        light.label = 'LIFX Colour'
+        light.model_name = 'LIFX Color'
+        lid = app.light_id(light)
+        mock_client = Mock()
+        mock_client.get_lights.return_value = [light]
+        mock_client.lights = {light.target: light}
+        mock_client.lock = threading.Lock()
+        app.lifx_client = mock_client
+        app.light_mappings = {
+            lid: {
+                'universe': 1,
+                'start_channel': 1,
+                'brightness': 1.0,
+                'channel_mode': 'RGB (8bit)',
+                'label': 'Stage Wash',
+                'model': 'LIFX Color',
+                'ip': '192.168.1.50',
+            }
+        }
+        app._dmx_mapping_cache_dirty = True
+        resp = self.client.get('/api/lights')
+        row = resp.get_json()['all_configured_lights'][0]
+        self.assertEqual(row['label'], 'Stage Wash')
+        self.assertEqual(row['mapping']['label'], 'Stage Wash')
+
     def test_list_lights_supercolour_shows_pixel_modes(self):
         from lifx_client import LifxLight
         light = LifxLight(bytes.fromhex('d073d5a29dd40000'), '192.168.1.122')
@@ -883,6 +911,17 @@ class TestTestRgbApi(unittest.TestCase):
         self.assertEqual(data['error'], 'Light not found')
         mock_client.executor.submit.assert_not_called()
 
+    def test_test_rgb_rejects_invalid_fade_ms(self):
+        light, mock_client = self._mock_light()
+        lid = app.light_id(light)
+        resp = self.client.post('/api/lights/test-rgb', json={
+            'light_id': lid, 'r': 1, 'g': 2, 'b': 3, 'brightness': 1.0, 'fade_ms': 45.5,
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()['success'])
+        mock_client.executor.submit.assert_not_called()
+        self.assertEqual(app._batch_commands_by_id, {})
+
 
 class TestUpdateMappingChannelMode(unittest.TestCase):
     def setUp(self):
@@ -951,6 +990,45 @@ class TestUpdateMappingChannelMode(unittest.TestCase):
         })
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()['mapping']['channel_mode'], 'RGB 8 Pixel (8bit)')
+
+    @patch('app._restart_dmx_if_running')
+    @patch('app.save_config')
+    def test_rename_keeps_custom_label_when_device_is_discovered(self, _save, _restart):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+        light.label = 'LIFX Colour'
+        light.model_name = 'LIFX Color'
+        lid = app.light_id(light)
+        mock_client = Mock()
+        mock_client.get_lights.return_value = [light]
+        app.lifx_client = mock_client
+        app.light_mappings[lid] = {
+            'universe': 1,
+            'start_channel': 1,
+            'brightness': 1.0,
+            'channel_mode': 'RGB (8bit)',
+            'label': 'LIFX Colour',
+            'model': 'LIFX Color',
+            'ip': '192.168.1.50',
+        }
+        resp = self.client.post('/api/mappings', json={
+            'light_id': lid,
+            'universe': 1,
+            'start_channel': 1,
+            'channel_mode': 'RGB (8bit)',
+            'label': 'Stage Wash',
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()['mapping']['label'], 'Stage Wash')
+        row = app._configured_light_row(lid, app.light_mappings[lid], light)
+        self.assertEqual(row['label'], 'Stage Wash')
+        resp = self.client.post('/api/mappings', json={
+            'light_id': lid,
+            'universe': 1,
+            'start_channel': 1,
+            'channel_mode': 'RGB (8bit)',
+        })
+        self.assertEqual(resp.get_json()['mapping']['label'], 'Stage Wash')
 
 
 class TestTestPixelsValidation(unittest.TestCase):
@@ -1057,6 +1135,9 @@ class TestMetricsUtilization(unittest.TestCase):
         self.assertAlmostEqual(data['metrics']['batch_efficiency'], 0.5)
         self.assertAlmostEqual(data['metrics']['batch_utilization_percent'], 50.0)
         self.assertIn('current_queue_size', data['metrics'])
+        self.assertIn('last_drain_duration_s', data['metrics'])
+        self.assertIn('peak_drain_duration_s', data['metrics'])
+        self.assertIn('drain_overrun_count', data['metrics'])
 
     def test_batch_utilization_zero_without_peak_capacity(self):
         with app._perf_lock:
@@ -1067,6 +1148,64 @@ class TestMetricsUtilization(unittest.TestCase):
         data = self.client.get('/api/metrics').get_json()
         self.assertEqual(data['metrics']['batch_efficiency'], 0.0)
         self.assertEqual(data['metrics']['batch_utilization_percent'], 0.0)
+
+
+class TestBatchDrainDuration(unittest.TestCase):
+    def setUp(self):
+        self._saved_client = app.lifx_client
+        self._last_batch = app._last_batch_time
+        with app._perf_lock:
+            self._overrun = app._perf_metrics['drain_overrun_count']
+            self._last_drain = app._perf_metrics['last_drain_duration_s']
+            self._peak = app._perf_metrics['peak_drain_duration_s']
+            self._batches_sent = app._perf_metrics['total_batches_sent']
+            self._commands_sent = app._perf_metrics['total_commands_sent']
+            self._batch_sizes = list(app._perf_metrics['batch_sizes'])
+            self._avg = app._perf_metrics['avg_batch_size']
+        with app._batch_lock:
+            self._saved_batch = dict(app._batch_commands_by_id)
+            app._batch_commands_by_id.clear()
+
+    def tearDown(self):
+        app.lifx_client = self._saved_client
+        app._last_batch_time = self._last_batch
+        with app._perf_lock:
+            app._perf_metrics['drain_overrun_count'] = self._overrun
+            app._perf_metrics['last_drain_duration_s'] = self._last_drain
+            app._perf_metrics['peak_drain_duration_s'] = self._peak
+            app._perf_metrics['total_batches_sent'] = self._batches_sent
+            app._perf_metrics['total_commands_sent'] = self._commands_sent
+            app._perf_metrics['avg_batch_size'] = self._avg
+            app._perf_metrics['batch_sizes'].clear()
+            app._perf_metrics['batch_sizes'].extend(self._batch_sizes)
+        with app._batch_lock:
+            app._batch_commands_by_id.clear()
+            app._batch_commands_by_id.update(self._saved_batch)
+
+    def test_records_drain_duration_when_send_exceeds_interval(self):
+        clock = {'t': 1000.0}
+        light = SimpleNamespace(target=b'\x01' * 8, ip='192.168.1.10', label='Lamp')
+        mock_client = Mock()
+
+        def send(*_args, **_kwargs):
+            clock['t'] += 0.05
+
+        mock_client.send_color_now.side_effect = send
+        app.lifx_client = mock_client
+        app._last_batch_time = 0
+        with app._batch_lock:
+            app._batch_commands_by_id['lamp'] = (
+                'color', light, 1.0, 0.0, 0.0, 3500, 45, 1.0,
+            )
+        with patch('app.time.time', side_effect=lambda: clock['t']):
+            app._lifx_send_one_batch()
+        mock_client.send_color_now.assert_called_once()
+        self.assertAlmostEqual(app._perf_metrics['last_drain_duration_s'], 0.05)
+        self.assertGreaterEqual(
+            app._perf_metrics['peak_drain_duration_s'],
+            app._perf_metrics['last_drain_duration_s'],
+        )
+        self.assertEqual(app._perf_metrics['drain_overrun_count'], self._overrun + 1)
 
 
 if __name__ == '__main__':

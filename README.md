@@ -8,6 +8,7 @@ Control LIFX lights via sACN/E1.31 with automatic discovery and web-based mappin
 
 - **Automatic LIFX Discovery**: Automatically discovers all LIFX lights on your network using the LIFX LAN protocol
 - **Web UI**: Clean, intuitive web interface for mapping lights to DMX universes and channels
+- **Rename Lights**: Give mapped lights a custom name in the UI; the name is stored in `config.json` and does not change the bulb's LIFX label
 - **E1.31/sACN Support**: Receives DMX data via sACN (E1.31) protocol with real-time status monitoring
 - **Test RGB Mode**: Test lights directly without DMX input - useful for debugging and verification
 - **Network Interface Selection**: Choose specific network interfaces for LIFX discovery and sACN reception
@@ -93,9 +94,12 @@ To leave the venv later: `deactivate`.
 ## Usage
 
 1. Start the server:
+
 ```bash
 python3 app.py
 ```
+
+The development server binds to `127.0.0.1` by default (`FLASK_HOST` overrides this). The API is unauthenticated; on untrusted networks put it behind a reverse proxy or a production WSGI server.
 
 2. Open your browser to `http://localhost:5001`
 
@@ -110,6 +114,7 @@ python3 app.py
 
 5. **Configure Light Mappings**:
    For each light, configure:
+   - **Name**: Optional display name for this mapping (stored locally; the physical LIFX label is unchanged)
    - **Universe**: The DMX universe number (typically 1-512)
    - **Start Channel**: The first DMX channel for this light
    - **Brightness**: Overall brightness multiplier (0-100%)
@@ -321,6 +326,7 @@ A fade a bit longer than the send interval keeps the bulb interpolating toward t
 - **`python3` not found / version too old**: Install Python 3.9+ as described in [Installation](#installation), then open a new terminal. On Windows try `python` instead of `python3`.
 - **Lights not discovered**: Ensure lights are on the same network and powered on. Try using "Manually Add Light" with the light's IP address.
 - **DMX not receiving**: Check that the sACN interface is correctly configured and that your DMX source is sending to the correct universe.
+- **Unicast sACN works, multicast does not**: Select the LAN interface your console uses under sACN interface, then Save & Apply and restart DMX. The receiver binds to all addresses so `239.255.x.x` packets arrive, and joins the multicast group on that NIC.
 - **Stepping/jerky transitions**: Restart after this update so the longer fade and direct sends take effect. If it is still steppy, run with `FADE_DURATION_MS=60`. Fast 8-bit RGB chases also look smoother in **HSBK (8bit)** mode because hue is linear.
 - **Configuration not saving**: Ensure the application has write permissions in the project directory.
 

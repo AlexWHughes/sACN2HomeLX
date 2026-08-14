@@ -752,6 +752,38 @@ class TestMultizonePackets(unittest.TestCase):
         packed = self._set64_colors(packets[0], 8)
         self.assertEqual(packed, [(i * 10, 1, 2, 3500) for i in range(8)])
 
+    def test_legacy_linear_emits_set_color_zones_per_run(self):
+        light = LifxLight(b'\x09' * 8, '192.168.1.16')
+        light.layout = 'linear'
+        light.product = 31
+        colors = [(1, 2, 3, 3500), (1, 2, 3, 3500), (4, 5, 6, 3500)]
+        packets = self.client._zone_packets_for_light(light, colors, 20)
+        self.assertEqual(len(packets), 2)
+        self.assertEqual(
+            struct.unpack_from('<H', packets[0], 32)[0],
+            lifx_client.SET_COLOR_ZONES,
+        )
+        start0, end0 = packets[0][lifx_client.HEADER_SIZE:lifx_client.HEADER_SIZE + 2]
+        start1, end1 = packets[1][lifx_client.HEADER_SIZE:lifx_client.HEADER_SIZE + 2]
+        self.assertEqual((start0, end0), (0, 1))
+        self.assertEqual((start1, end1), (2, 2))
+        apply0 = packets[0][lifx_client.HEADER_SIZE + 14]
+        apply1 = packets[1][lifx_client.HEADER_SIZE + 14]
+        self.assertEqual(apply0, lifx_client.MULTI_ZONE_NO_APPLY)
+        self.assertEqual(apply1, lifx_client.MULTI_ZONE_APPLY)
+
+    def test_extended_linear_still_uses_message_510(self):
+        light = LifxLight(b'\x0a' * 8, '192.168.1.17')
+        light.layout = 'linear'
+        light.product = 56
+        colors = [(1, 2, 3, 3500)] * 3
+        packets = self.client._zone_packets_for_light(light, colors, 20)
+        self.assertEqual(len(packets), 1)
+        self.assertEqual(
+            struct.unpack_from('<H', packets[0], 32)[0],
+            lifx_client.SET_EXTENDED_COLOR_ZONES,
+        )
+
     def test_supported_modes_come_from_exported_tuples(self):
         from lifx_client import STANDARD_CHANNEL_MODES, ZONE_CHANNEL_MODES
         self.assertEqual(

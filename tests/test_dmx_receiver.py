@@ -125,3 +125,80 @@ class TestDMXReceiverRestart(unittest.TestCase):
             self.assertEqual(ctor.call_count, 2)
             self.assertTrue(rx.running)
             rx.close()
+
+    def test_stop_failure_is_exposed_and_close_retries(self):
+        sock = MagicMock()
+        sock.stop.side_effect = [OSError('busy'), None]
+        with patch.object(dmx_receiver.sacn, 'sACNreceiver', return_value=sock):
+            rx = DMXReceiver()
+            with self.assertRaises(OSError):
+                rx.stop()
+            self.assertFalse(rx._stopped)
+            self.assertEqual(rx.get_stats()['last_stop_error'], 'busy')
+            rx.close()
+            self.assertTrue(rx._stopped)
+            self.assertIsNone(rx.get_stats()['last_stop_error'])
+            self.assertEqual(sock.stop.call_count, 2)
+
+    def test_stat_drain_uses_new_event_when_stats_lock_held(self):
+        first = MagicMock()
+        second = MagicMock()
+        with patch.object(dmx_receiver.sacn, 'sACNreceiver', side_effect=[first, second]):
+            rx = DMXReceiver()
+            old_thread = rx._stat_drain_thread
+            old_event = rx._stat_drain_stop
+            self.assertIsNotNone(old_thread)
+            self.assertTrue(old_thread.is_alive())
+            acquired = rx.stats_lock.acquire(timeout=1)
+            self.assertTrue(acquired)
+            try:
+                rx.stop()
+                rx.start()
+                new_thread = rx._stat_drain_thread
+                new_event = rx._stat_drain_stop
+                self.assertIsNot(new_thread, old_thread)
+                self.assertIsNot(new_event, old_event)
+                self.assertTrue(new_thread.is_alive())
+                self.assertTrue(old_event.is_set())
+                self.assertFalse(new_event.is_set())
+                self.assertIs(rx._stat_drain_thread, new_thread)
+            finally:
+                rx.stats_lock.release()
+                rx.close()
+            old_thread.join(timeout=1.0)
+            self.assertFalse(old_thread.is_alive())
+
+
+class TestDMXReceiverMulticast(unittest.TestCase):
+    def test_receiver_binds_any_and_joins_selected_interface(self):
+        sock = MagicMock()
+        with patch.object(dmx_receiver.sacn, 'sACNreceiver', return_value=sock) as ctor:
+            rx = DMXReceiver(bind_ip='192.168.1.50')
+            self.addCleanup(rx.close)
+            ctor.assert_called_once_with()
+            self.assertEqual(sock._handler.socket._bind_address, '192.168.1.50')
+            rx.listen_to_universe(1, MagicMock())
+            sock.join_multicast.assert_called_with(1)
+            sock._handler.socket._socket.setsockopt.assert_not_called()
+
+    def test_all_interfaces_joins_each_local_ipv4(self):
+        sock = MagicMock()
+        extra = sock._handler.socket._socket
+        with patch.object(dmx_receiver.sacn, 'sACNreceiver', return_value=sock):
+            with patch.object(
+                dmx_receiver, '_local_ipv4_addresses', return_value=['10.0.0.5', '192.168.1.50']
+            ):
+                rx = DMXReceiver()
+                self.addCleanup(rx.close)
+                self.assertEqual(sock._handler.socket._bind_address, '10.0.0.5')
+                rx.listen_to_universe(7, MagicMock())
+                sock.join_multicast.assert_called_with(7)
+                extra.setsockopt.assert_called_once()
+                args = extra.setsockopt.call_args[0]
+                self.assertEqual(args[0], dmx_receiver.socket.IPPROTO_IP)
+                self.assertEqual(args[1], dmx_receiver.socket.IP_ADD_MEMBERSHIP)
+                self.assertEqual(
+                    args[2],
+                    dmx_receiver.socket.inet_aton('239.255.0.7')
+                    + dmx_receiver.socket.inet_aton('192.168.1.50'),
+                )

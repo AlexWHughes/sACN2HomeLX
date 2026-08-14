@@ -49,6 +49,7 @@ SET_POWER = 21
 GET_COLOR_ZONES = 502
 STATE_ZONE = 503
 STATE_MULTIZONE = 506
+SET_COLOR_ZONES = 501
 SET_EXTENDED_COLOR_ZONES = 510
 GET_EXTENDED_COLOR_ZONES = 511
 STATE_EXTENDED_COLOR_ZONES = 512
@@ -473,6 +474,44 @@ class LifxLanClient:
             packets.append(self._finalise(header + payload))
         return packets
 
+    def _build_legacy_mz_packets(
+        self,
+        target: bytes,
+        colors: List[Tuple[int, int, int, int]],
+        duration_ms: int,
+    ) -> List[bytes]:
+        """Build SetColorZones (501) packets, one per contiguous colour run."""
+        packets = []
+        if not colors:
+            return packets
+        runs: List[Tuple[int, int, Tuple[int, int, int, int]]] = []
+        start = 0
+        current = colors[0]
+        for index in range(1, len(colors)):
+            if colors[index] != current:
+                runs.append((start, index - 1, current))
+                start = index
+                current = colors[index]
+        runs.append((start, len(colors) - 1, current))
+        last = len(runs) - 1
+        for run_index, (start_index, end_index, color) in enumerate(runs):
+            apply = MULTI_ZONE_APPLY if run_index == last else MULTI_ZONE_NO_APPLY
+            hue, sat, bri, kel = color
+            payload = struct.pack(
+                "<BBHHHHIB",
+                start_index & 0xFF,
+                end_index & 0xFF,
+                hue & 0xFFFF,
+                sat & 0xFFFF,
+                bri & 0xFFFF,
+                kel & 0xFFFF,
+                int(duration_ms),
+                apply,
+            )
+            header = self._build_header(SET_COLOR_ZONES, target=target, tagged=False)
+            packets.append(self._finalise(header + payload))
+        return packets
+
     def _zone_packets_for_light(
         self,
         light: LifxLight,
@@ -507,7 +546,9 @@ class LifxLanClient:
                     )
                 )
             return packets
-        return self._build_extended_mz_packets(light.target, colors, duration_ms)
+        if light.product in EXTENDED_MULTIZONE_PRODUCT_IDS:
+            return self._build_extended_mz_packets(light.target, colors, duration_ms)
+        return self._build_legacy_mz_packets(light.target, colors, duration_ms)
 
     def set_zones_batch(
         self,

@@ -373,6 +373,10 @@
             padding-bottom: 2px;
         }
 
+        .map-form .field-name {
+            grid-column: 1 / -1;
+        }
+
         .field {
             display: flex;
             flex-direction: column;
@@ -897,7 +901,7 @@
 
             const discoveredContainer = document.getElementById('discoveredLightsContainer');
             if (discoveredContainer) {
-                const inputs = discoveredContainer.querySelectorAll('input[type="number"], select');
+                const inputs = discoveredContainer.querySelectorAll('input[type="number"], input[type="text"], select');
                 inputs.forEach(input => {
                     if (input.value && input.value.trim() !== '') {
                         formValues[input.id] = input.value;
@@ -912,7 +916,7 @@
                     if (form.style.display !== 'none') {
                         const lightId = form.id.replace('edit-form-', '');
                         openEditForms.push(lightId);
-                        const inputs = form.querySelectorAll('input[type="number"], select');
+                        const inputs = form.querySelectorAll('input[type="number"], input[type="text"], select');
                         inputs.forEach(input => {
                             if (input.value && input.value.trim() !== '') {
                                 formValues[input.id] = input.value;
@@ -1116,6 +1120,8 @@
             const startChannel = document.getElementById(`edit-channel-${lightId}`).value.trim();
             const brightness = document.getElementById(`edit-brightness-${lightId}`).value.trim();
             const channelMode = document.getElementById(`edit-channel-mode-${lightId}`).value;
+            const labelEl = document.getElementById(`edit-label-${lightId}`);
+            const label = labelEl ? labelEl.value.trim() : '';
 
             if (!universe || !startChannel) {
                 showNotification('Please fill in Universe and Start Channel', true);
@@ -1142,6 +1148,10 @@
                     start_channel: channelNum,
                     channel_mode: channelMode || 'RGB (8bit)'
                 };
+
+                if (label) {
+                    requestBody.label = label;
+                }
 
                 if (brightnessNum !== null && !isNaN(brightnessNum)) {
                     requestBody.brightness = brightnessNum;
@@ -1220,6 +1230,10 @@
                                 </div>` : ''}
                             </div>
                             <div class="map-form" id="edit-form-${esc(light.id)}" style="display: none;">
+                                <label class="field field-name">
+                                    <span class="field-label">Name</span>
+                                    <input type="text" id="edit-label-${esc(light.id)}" value="${esc(light.label)}" maxlength="64" placeholder="Light name">
+                                </label>
                                 <label class="field">
                                     <span class="field-label">Universe</span>
                                     <input type="number" id="edit-universe-${esc(light.id)}" value="${esc(mapping.universe || '')}" placeholder="1" min="1">
@@ -1230,6 +1244,7 @@
                                 </label>
                                 <label class="field">
                                     <span class="field-label">Intensity Limit %</span>
+                                    <input type="number" id="edit-brightness-${esc(light.id)}" value="${mapping.brightness !== undefined ? Math.round(mapping.brightness * 100) : 100}" step="1" min="0" max="100">
                                 </label>
                                 <label class="field field-mode">
                                     <span class="field-label">Mode</span>
@@ -1268,6 +1283,10 @@
                             <div class="light-label">${esc(light.label)}</div>
                             <div class="light-meta">${esc(light.ip)} · ${esc(light.model || 'Unknown model')}</div>
                             <div class="map-form">
+                                <label class="field field-name">
+                                    <span class="field-label">Name</span>
+                                    <input type="text" id="label-${esc(light.id)}" value="${esc(light.label)}" maxlength="64" placeholder="Light name">
+                                </label>
                                 <label class="field">
                                     <span class="field-label">Universe</span>
                                     <input type="number" id="universe-${esc(light.id)}" placeholder="1" min="1">
@@ -1302,6 +1321,8 @@
             const startChannel = document.getElementById(`channel-${lightId}`).value;
             const brightness = document.getElementById(`brightness-${lightId}`).value;
             const channelMode = document.getElementById(`channel-mode-${lightId}`).value;
+            const labelEl = document.getElementById(`label-${lightId}`);
+            const label = labelEl ? labelEl.value.trim() : '';
 
             if (!universe || !startChannel) {
                 showNotification('Please fill in Universe and Start Channel', true);
@@ -1317,7 +1338,8 @@
                         universe: parseInt(universe),
                         start_channel: parseInt(startChannel),
                         brightness: parseFloat(brightness) / 100,
-                        channel_mode: channelMode
+                        channel_mode: channelMode,
+                        ...(label ? { label } : {})
                     })
                 });
 

@@ -1,4 +1,4 @@
-flask>=3.1.3
-sacn>=1.11.0
-ifaddr>=0.2.0
-
+flask>=3.1.3,<4
+werkzeug>=3.1.0,<4
+sacn>=1.11.0,<2
+ifaddr>=0.2.0,<1

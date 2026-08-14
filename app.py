@@ -44,6 +44,9 @@ except ImportError:
 # RGBW_WHITE_BLEND_COEFF: When mixing the W channel into R/G/B for RGBW DMX modes, fraction of W added to each (0–1, default 0.3)
 # FADE_DURATION_MS: LIFX interpolation time (default 45). Longer than the send interval hides jitter.
 # LIFX_BATCH_INTERVAL_MS: Minimum ms between LIFX send ticks (default 20).
+# FLASK_HOST: Bind address for the development server (default 127.0.0.1).
+# The Flask development server and this API are unauthenticated. On untrusted
+# networks put them behind a reverse proxy or a production WSGI server.
 
 enable_dmx_log = os.getenv('ENABLE_DMX_LOG', 'false').lower() in ('true', '1', 'yes')
 enable_perf_logging = os.getenv('ENABLE_PERF_LOGGING', 'false').lower() in ('true', '1', 'yes')
@@ -96,6 +99,7 @@ dmx_lock = threading.Lock()
 # Configuration
 CONFIG_FILE = "config.json"
 MAX_BRIGHTNESS = 1.0  # Stored as 0-1 internally, displayed as 0-100%
+MAX_LIGHT_LABEL_LEN = 64
 OVERRIDE_MAX_BRIGHT_TOTAL_RGB = 200 * 3
 MAX_BRIGHT_OVERRIDE = 1.0
 MAX_RGB_PER_COLOUR = 255
@@ -507,6 +511,21 @@ def light_id(light: LifxLight) -> str:
     return light.target.hex()
 
 
+def _display_label(light: Optional[LifxLight], mapping: Optional[Dict] = None, lid: str = '') -> str:
+    stored = (mapping or {}).get('label')
+    if isinstance(stored, str):
+        stored = stored.strip()
+        if stored:
+            return stored
+    if light is not None and light.label:
+        return light.label
+    if lid:
+        return f'Light {lid[:10]}'
+    if light is not None:
+        return f'Light {light.ip}'
+    return 'Light'
+
+
 def _light_summary(light: LifxLight, lid: Optional[str] = None) -> Dict:
     resolved_id = lid or light_id(light)
     return {
@@ -658,7 +677,7 @@ def _configured_light_row(lid: str, mapping: Dict, light: Optional[LifxLight]) -
         return {
             **_light_summary(light, lid),
             **_light_zone_fields(light, mapping),
-            'label': light.label or mapping.get('label') or lid,
+            'label': _display_label(light, mapping, lid),
             'discovered': True,
             'supported_modes': _supported_modes_for(light, mapping),
             'mode_options': _mode_options_for(light, mapping),
@@ -667,7 +686,7 @@ def _configured_light_row(lid: str, mapping: Dict, light: Optional[LifxLight]) -
         }
     return {
         'id': lid,
-        'label': mapping.get('label') or f'Light {lid[:10]}',
+        'label': _display_label(None, mapping, lid),
         'ip': mapping.get('ip') or '',
         'model': mapping.get('model') or 'Unknown',
         'discovered': False,
@@ -739,7 +758,10 @@ _perf_metrics = {
     'peak_fixtures_per_frame': 0,
     'last_reset_time': time.time(),
     'frame_times': deque(maxlen=100),  # Last 100 frame times for rolling average
-    'batch_sizes': deque(maxlen=50)    # Last 50 batch sizes
+    'batch_sizes': deque(maxlen=50),   # Last 50 batch sizes
+    'last_drain_duration_s': 0.0,
+    'peak_drain_duration_s': 0.0,
+    'drain_overrun_count': 0,
 }
 _perf_lock = threading.Lock()
 _PERF_RATE_WINDOW_S = 5.0
@@ -788,6 +810,7 @@ def _lifx_send_one_batch():
         return
     
     batch_size = len(batch)
+    drain_start = time.time()
     
     for item in batch:
         try:
@@ -811,6 +834,7 @@ def _lifx_send_one_batch():
             else:
                 print(msg)
     
+    drain_duration = time.time() - drain_start
     _last_batch_time = current_time
     
     with _perf_lock:
@@ -821,6 +845,11 @@ def _lifx_send_one_batch():
         _perf_rate_commands.append((current_time, batch_size))
         if len(_perf_metrics['batch_sizes']) > 0:
             _perf_metrics['avg_batch_size'] = sum(_perf_metrics['batch_sizes']) / len(_perf_metrics['batch_sizes'])
+        _perf_metrics['last_drain_duration_s'] = drain_duration
+        if drain_duration > _perf_metrics['peak_drain_duration_s']:
+            _perf_metrics['peak_drain_duration_s'] = drain_duration
+        if drain_duration > BATCH_INTERVAL:
+            _perf_metrics['drain_overrun_count'] += 1
 
 
 def _lifx_batch_sender_worker(stop_event: threading.Event):
@@ -1071,7 +1100,11 @@ def _restart_dmx_if_running():
     try:
         # Stop the old receiver (may block)
         if old_receiver:
-            old_receiver.stop()
+            try:
+                old_receiver.stop()
+            except Exception as e:
+                print(f"Error stopping DMX receiver during restart: {e}")
+                raise
             old_receiver.reset_stats()
         
         # Wait for thread to finish (may block)
@@ -1386,22 +1419,31 @@ def update_mapping():
         # Get existing mapping to preserve label/model/ip if light isn't currently discovered
         existing_mapping = light_mappings.get(mapped_light_id, {})
         
-        # Try to get light info if available
-        light_label = existing_mapping.get('label')  # Preserve existing if available
-        light_model = existing_mapping.get('model')  # Preserve existing if available
-        light_ip = existing_mapping.get('ip')  # Preserve existing if available
+        light_label = existing_mapping.get('label')
+        light_model = existing_mapping.get('model')
+        light_ip = existing_mapping.get('ip')
         matched_light = None
         
         if lifx_client:
             lights = lifx_client.get_lights()
             for light in lights:
                 if light_id(light) == mapped_light_id:
-                    # Update with current discovered info
-                    light_label = light.label
-                    light_model = light.model_name
-                    light_ip = light.ip
+                    light_model = light.model_name or light_model
+                    light_ip = light.ip or light_ip
                     matched_light = light
+                    if not light_label:
+                        light_label = light.label
                     break
+
+        requested_label = data.get('label')
+        if isinstance(requested_label, str):
+            requested_label = requested_label.strip()[:MAX_LIGHT_LABEL_LEN]
+            if requested_label:
+                light_label = requested_label
+        if not light_label and matched_light is not None:
+            light_label = matched_light.label
+        if matched_light is not None and light_label:
+            matched_light.label = light_label
         
         # Get values from request
         universe = data.get('universe')
@@ -1533,6 +1575,7 @@ def add_manual_light():
         lid = light.target.hex()
         light_label = light.label or label or f"Light {ip}"
         light_model = light.model_name or 'Unknown Model'
+        zone_fields = _light_zone_fields(light)
         supported_modes = _supported_modes_for(light)
     else:
         # Create a placeholder ID based on IP (will be updated when discovered)
@@ -1542,6 +1585,7 @@ def add_manual_light():
         light_label = label or f"Light {ip}"
         light_model = 'Not discovered'
         supported_modes = STANDARD_CHANNEL_MODES
+        zone_fields = None
     
     # Check if mapping already exists for this light_id
     if lid in light_mappings:
@@ -1557,6 +1601,14 @@ def add_manual_light():
         'universe': None,  # User needs to configure this
         'start_channel': None  # User needs to configure this
     }
+    if zone_fields is not None:
+        mapping.update({
+            'zone_capable': zone_fields['zone_capable'],
+            'zone_count': zone_fields['zone_count'],
+            'zone_layout': zone_fields['zone_layout'],
+            'matrix_width': zone_fields['matrix_width'],
+            'matrix_height': zone_fields['matrix_height'],
+        })
     
     light_mappings[lid] = mapping
     invalidate_dmx_mapping_cache()
@@ -1749,6 +1801,10 @@ def test_rgb():
     # Validate brightness (0.0-1.0)
     if not (0.0 <= brightness <= 1.0):
         return jsonify({'success': False, 'error': 'Brightness must be 0.0-1.0'}), 400
+    
+    fade_ms = _coerce_fade_ms(fade_ms)
+    if fade_ms is None:
+        return jsonify({'success': False, 'error': 'fade_ms must be an integer from 0 to 4294967295'}), 400
     
     light = _light_from_id(requested_light_id)
     if not light:
@@ -1980,5 +2036,8 @@ if __name__ == '__main__':
     print("Open http://localhost:5001 in your browser")
     
     debug = os.getenv('FLASK_DEBUG', 'false').lower() in ('true', '1', 'yes')
-    app.run(host='0.0.0.0', port=5001, debug=debug, request_handler=_ErrorOnlyRequestHandler)
+    # Development server only. Bind defaults to loopback; the API has no auth.
+    # On untrusted networks use a reverse proxy or a production WSGI server.
+    host = os.getenv('FLASK_HOST', '127.0.0.1')
+    app.run(host=host, port=5001, debug=debug, request_handler=_ErrorOnlyRequestHandler)
 
