@@ -1,6 +1,7 @@
 @echo off
-setlocal EnableDelayedExpansion
+setlocal DisableDelayedExpansion
 cd /d "%~dp0"
+setlocal EnableDelayedExpansion
 
 where py >nul 2>&1
 if %ERRORLEVEL%==0 (

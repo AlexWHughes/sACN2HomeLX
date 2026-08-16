@@ -3,7 +3,7 @@
 sACN2HomeLX - Control LIFX and Nanoleaf lights via sACN/E1.31
 """
 
-VERSION = "160826 011"
+VERSION = "160826 012"
 
 import json
 import os
@@ -1367,11 +1367,15 @@ def _nl_send_one_batch():
 
     drain_start = time.time()
     workers = min(NANOLEAF_BATCH_WORKERS, len(batch))
-    if workers <= 1 or _nl_batch_executor is None:
+    futures = None
+    with _nl_batch_sender_start_lock:
+        executor = _nl_batch_executor
+        if workers > 1 and executor is not None:
+            futures = [executor.submit(_nl_send_batch_item, item) for item in batch]
+    if futures is None:
         for item in batch:
             _nl_send_batch_item(item)
     else:
-        futures = [_nl_batch_executor.submit(_nl_send_batch_item, item) for item in batch]
         for future in as_completed(futures):
             future.result()
 
