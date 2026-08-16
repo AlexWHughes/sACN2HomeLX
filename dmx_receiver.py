@@ -14,6 +14,7 @@ except ImportError:
 
 # Merge queued packet events into stats at most this often (bounded queue latency for UI)
 _STAT_DRAIN_INTERVAL_S = 0.05
+_ifaddr_missing_warned = False
 
 
 def _local_ipv4_addresses() -> List[str]:
@@ -58,6 +59,7 @@ class DMXReceiver:
         self._stat_drain_stop: Optional[threading.Event] = None
         self._stat_drain_thread: Optional[threading.Thread] = None
         self._last_stop_error: Optional[str] = None
+        self._multicast_internals_missing = False
         self._start_receiver()
         self._start_stat_drain_thread()
     
@@ -124,29 +126,43 @@ class DMXReceiver:
     def _membership_ips(self) -> List[str]:
         if self.bind_ip:
             return [self.bind_ip]
-        return _local_ipv4_addresses() or ['0.0.0.0']
+        addrs = _local_ipv4_addresses()
+        if addrs:
+            return addrs
+        global _ifaddr_missing_warned
+        if ifaddr is None and not _ifaddr_missing_warned:
+            _ifaddr_missing_warned = True
+            print("Warning: ifaddr is not installed; sACN multicast membership falling back to 0.0.0.0")
+        return ['0.0.0.0']
 
     def _apply_multicast_interface(self) -> None:
         sock_impl = getattr(getattr(self.receiver, '_handler', None), 'socket', None)
         if sock_impl is None:
+            self._note_missing_multicast_internals()
             return
         try:
             sock_impl._bind_address = self._membership_ips()[0]
         except AttributeError:
-            pass
+            self._note_missing_multicast_internals()
 
     def _join_multicast(self, universe: int) -> None:
         """Join the universe multicast group on the selected NIC (or every NIC)."""
         ips = self._membership_ips()
         sock_impl = getattr(getattr(self.receiver, '_handler', None), 'socket', None)
-        if sock_impl is not None:
+        if sock_impl is None:
+            self._note_missing_multicast_internals()
+        else:
             try:
                 sock_impl._bind_address = ips[0]
             except AttributeError:
-                pass
+                self._note_missing_multicast_internals()
         self.receiver.join_multicast(universe)
         raw = getattr(sock_impl, '_socket', None) if sock_impl is not None else None
-        if raw is None or len(ips) <= 1:
+        if raw is None:
+            if sock_impl is not None:
+                self._note_missing_multicast_internals()
+            return
+        if len(ips) <= 1:
             return
         mcast = calculate_multicast_addr(universe)
         for ip in ips[1:]:
@@ -158,6 +174,15 @@ class DMXReceiver:
                 )
             except OSError as e:
                 print(f"Error joining multicast for universe {universe} on {ip}: {e}")
+
+    def _note_missing_multicast_internals(self) -> None:
+        if self._multicast_internals_missing:
+            return
+        self._multicast_internals_missing = True
+        print(
+            "Warning: sACN receiver is missing expected multicast socket internals; "
+            "interface selection and extra NIC joins may not apply"
+        )
         
     def listen_to_universe(self, universe: int, callback: Callable):
         """Register a callback for a specific DMX universe"""
@@ -229,6 +254,7 @@ class DMXReceiver:
             'receiving': receiving,
             'last_start_errors': list(self._last_start_errors),
             'last_stop_error': self._last_stop_error,
+            'multicast_internals_missing': self._multicast_internals_missing,
         }
 
     def get_stats(self) -> Dict:

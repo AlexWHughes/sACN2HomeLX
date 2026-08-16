@@ -548,6 +548,19 @@ class TestDiscoveryBroadcast(unittest.TestCase):
         finally:
             client.close()
 
+    @patch('time.sleep')
+    def test_discover_keeps_existing_lights(self, _mock_sleep):
+        client, _mock_sock = self._mock_client()
+        try:
+            existing = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+            existing.label = 'Keep Me'
+            client.lights[existing.target] = existing
+            found = client.discover_lights(timeout=0)
+            self.assertIn(existing.target, client.lights)
+            self.assertTrue(any(light.target == existing.target for light in found))
+        finally:
+            client.close()
+
     def test_live_socket_broadcast_does_not_raise_permission_denied(self):
         client = LifxLanClient(bind_ip="0.0.0.0")
         try:
@@ -771,6 +784,28 @@ class TestMultizonePackets(unittest.TestCase):
         apply1 = packets[1][lifx_client.HEADER_SIZE + 14]
         self.assertEqual(apply0, lifx_client.MULTI_ZONE_NO_APPLY)
         self.assertEqual(apply1, lifx_client.MULTI_ZONE_APPLY)
+
+    def test_legacy_linear_truncates_past_8bit_zone_range(self):
+        light = LifxLight(b'\x09' * 8, '192.168.1.16')
+        light.layout = 'linear'
+        light.product = 31
+        colors = [(i, 1, 2, 3500) for i in range(lifx_client.LEGACY_MZ_MAX_ZONES + 10)]
+        packets = self.client._zone_packets_for_light(light, colors, 20)
+        last_start, last_end = packets[-1][lifx_client.HEADER_SIZE:lifx_client.HEADER_SIZE + 2]
+        self.assertLess(last_end, lifx_client.LEGACY_MZ_MAX_ZONES)
+        self.assertLessEqual(len(packets), lifx_client.LEGACY_MZ_PACKET_BUDGET)
+
+    def test_legacy_linear_coalesces_runs_to_packet_budget(self):
+        light = LifxLight(b'\x09' * 8, '192.168.1.16')
+        light.layout = 'linear'
+        light.product = 31
+        colors = [(i, 1, 2, 3500) for i in range(40)]
+        packets = self.client._zone_packets_for_light(light, colors, 20)
+        self.assertLessEqual(len(packets), lifx_client.LEGACY_MZ_PACKET_BUDGET)
+        self.assertLess(len(packets), 40)
+        start0, end0 = packets[0][lifx_client.HEADER_SIZE:lifx_client.HEADER_SIZE + 2]
+        self.assertEqual(start0, 0)
+        self.assertGreater(end0, 0)
 
     def test_extended_linear_still_uses_message_510(self):
         light = LifxLight(b'\x0a' * 8, '192.168.1.17')

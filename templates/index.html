@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#0c0e10">
-    <title>sACN2LIFX</title>
+    <title>sACN2HomeLX — LIFX + Nanoleaf</title>
     <style>
         :root {
             --bg: #0c0e10;
@@ -100,6 +100,9 @@
             font-family: var(--mono);
             margin-top: 1px;
         }
+
+        .brand-sub a { color: var(--text-dim); }
+        .brand-sub a:hover { color: var(--cyan); }
 
         .readouts {
             display: flex;
@@ -350,6 +353,108 @@
         .chip-mode {
             background: rgba(110, 201, 214, 0.12);
             color: var(--cyan);
+        }
+
+        .chip-vendor {
+            background: rgba(232, 236, 239, 0.08);
+            color: var(--text-dim);
+        }
+
+        .chip-vendor.is-nanoleaf {
+            background: rgba(110, 201, 214, 0.12);
+            color: var(--cyan);
+        }
+
+        .pair-box {
+            margin-top: 12px;
+            padding: 12px;
+            border: 1px solid var(--line-strong);
+            border-radius: var(--radius);
+            background: var(--bg);
+        }
+
+        .pair-box p {
+            color: var(--text-dim);
+            font-size: 13px;
+            margin-bottom: 10px;
+        }
+
+        .panel-map {
+            margin-top: 12px;
+            padding: 10px 12px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: var(--bg);
+        }
+
+        .panel-map svg {
+            display: block;
+            width: min(100%, 360px);
+            height: auto;
+            max-height: 240px;
+        }
+
+        .panel-map polygon {
+            fill: rgba(232, 163, 58, 0.16);
+            stroke: var(--amber);
+            stroke-width: 3;
+        }
+
+        .panel-map.is-addressing polygon {
+            cursor: pointer;
+        }
+
+        .panel-map polygon.is-assigned {
+            fill: rgba(61, 204, 138, 0.22);
+            stroke: var(--live);
+        }
+
+        .panel-map polygon.is-next {
+            stroke: var(--cyan);
+        }
+
+        .panel-map text {
+            fill: var(--text);
+            font-family: var(--mono);
+            text-anchor: middle;
+            dominant-baseline: middle;
+            pointer-events: none;
+        }
+
+        .panel-map .panel-idx {
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        .panel-map .panel-ch {
+            font-size: 16px;
+            fill: var(--cyan);
+        }
+
+        .panel-map .field-hint { margin-top: 8px; }
+
+        .panel-map-actions {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 6px;
+            margin-top: 8px;
+        }
+
+        .panel-map-angle {
+            min-width: 3.2em;
+            color: var(--text-dim);
+            font-family: var(--mono);
+            font-size: 13px;
+            text-align: center;
+        }
+
+        .panel-map-actions select {
+            min-width: 5.5em;
+            padding: 4px 6px;
+            border: 1px solid var(--line-strong);
+            border-radius: var(--radius);
+            background: var(--bg-elev);
         }
 
         .row-actions {
@@ -649,8 +754,8 @@
                     </svg>
                 </div>
                 <div>
-                    <div class="brand-name">sACN<span>2</span>LIFX</div>
-                    <div class="brand-sub">v{{ version }}</div>
+                    <div class="brand-name">sACN<span>2</span>HomeLX</div>
+                    <div class="brand-sub">LIFX + Nanoleaf · v{{ version }} · <a href="https://github.com/AlexWHughes/sACN2HomeLX" target="_blank" rel="noopener noreferrer">GitHub</a></div>
                 </div>
             </div>
 
@@ -698,7 +803,7 @@
                     <div id="discoveredLightsContainer">
                         <div class="empty">
                             <p>Nothing waiting to be patched.</p>
-                            <p class="empty-hint">Discover lights on the network, or add one by IP.</p>
+                            <p class="empty-hint">Discover LIFX and Nanoleaf devices, or add one by IP.</p>
                         </div>
                     </div>
                 </section>
@@ -709,7 +814,7 @@
                     <div class="panel-head">
                         <h2 class="panel-title">Test</h2>
                     </div>
-                    <p class="field-hint" style="margin-bottom: 12px;">Colour is sent as you change it, without sACN. SuperColour fixtures get a second row for pixel mapping. Stop animations before going live.</p>
+                    <p class="field-hint" style="margin-bottom: 12px;">Colour is sent as you change it, without sACN. SuperColour and Nanoleaf panels get a second row for pixel mapping. Stop animations before going live.</p>
                     <div class="callout">Animations fight DMX for the same lights. Stop them before you press GO.</div>
                     <label class="field" style="margin-bottom: 12px;">
                         <span class="field-label">Animation interval (ms)</span>
@@ -724,11 +829,11 @@
                     <summary>Network</summary>
                     <div class="net-grid">
                         <label class="field">
-                            <span class="field-label">LIFX interface</span>
+                            <span class="field-label">Discovery interface</span>
                             <select id="lifxInterfaceSelect">
                                 <option value="">Loading interfaces…</option>
                             </select>
-                            <span class="field-hint">Used for light discovery</span>
+                            <span class="field-hint">Used for LIFX and Nanoleaf discovery</span>
                         </label>
                         <label class="field">
                             <span class="field-label">sACN interface</span>
@@ -743,7 +848,7 @@
 
                 <details class="fold">
                     <summary>Add by IP</summary>
-                    <p class="field-hint" style="margin-bottom: 12px;">Use this when a light does not show up in discovery.</p>
+                    <p class="field-hint" style="margin-bottom: 12px;">Use this when a LIFX or Nanoleaf device does not show up in discovery. Nanoleaf still needs pairing after it is added.</p>
                     <div class="net-grid">
                         <label class="field">
                             <span class="field-label">IP address</span>
@@ -760,9 +865,9 @@
         </main>
 
         <footer class="app-foot">
-            <span>sACN2LIFX v{{ version }}</span>
+            <span>sACN2HomeLX v{{ version }}</span>
             <span aria-hidden="true">·</span>
-            <a href="https://github.com/AlexWHughes/sACN2LIFX" target="_blank" rel="noopener noreferrer">GitHub</a>
+            <a href="https://github.com/AlexWHughes/sACN2HomeLX" target="_blank" rel="noopener noreferrer">GitHub</a>
             <span aria-hidden="true">·</span>
             <span>Alex Hughes</span>
         </footer>
@@ -773,6 +878,10 @@
     <script>
         let lights = [];
         let running = false;
+        let lastLightsData = { all_configured_lights: [], unconfigured_lights: [] };
+        let panelAddressDraft = null;
+        const panelRotationPending = {};
+        const panelRotationSaves = {};
 
         function esc(value) {
             return String(value ?? '')
@@ -792,6 +901,15 @@
                 .replace(/\u2028/g, '\\u2028')
                 .replace(/\u2029/g, '\\u2029');
             return esc(js);
+        }
+
+        function vendorLabel(light) {
+            return light.vendor === 'nanoleaf' ? 'Nanoleaf' : 'LIFX';
+        }
+
+        function lightMetaHtml(light) {
+            const vendor = vendorLabel(light);
+            return `${esc(light.ip)} · ${esc(light.model)} · ${esc(vendor)}`;
         }
 
         let _notificationTimer = null;
@@ -955,6 +1073,7 @@
 
                 if (data.success) {
                     lights = data.lights;
+                    lastLightsData = data;
                     renderLights(data);
                     restoreFormValues(savedData);
                 } else {
@@ -994,6 +1113,305 @@
                 return null;
             }
             return { kind: match[1], groups: match[2] ? parseInt(match[2], 10) : null };
+        }
+
+        function panelLayoutFrom(light, mapping) {
+            if (light && Array.isArray(light.panel_layout) && light.panel_layout.length) {
+                return light.panel_layout;
+            }
+            if (mapping && Array.isArray(mapping.panel_layout)) {
+                return mapping.panel_layout;
+            }
+            return [];
+        }
+
+        function panelIdsFrom(light, mapping) {
+            if (light && Array.isArray(light.panel_ids) && light.panel_ids.length) {
+                return light.panel_ids.map(Number);
+            }
+            if (mapping && Array.isArray(mapping.panel_ids) && mapping.panel_ids.length) {
+                return mapping.panel_ids.map(Number);
+            }
+            return panelLayoutFrom(light, mapping).map(panel => Number(panel.id));
+        }
+
+        function normalizeMapRotation(raw) {
+            const degrees = ((Number(raw) || 0) % 360 + 360) % 360;
+            return Math.round(degrees / 15) * 15 % 360;
+        }
+
+        function mapRotationFrom(light, mapping) {
+            const pending = light && light.id != null ? panelRotationPending[light.id] : undefined;
+            const raw = pending != null
+                ? pending
+                : (light && light.map_rotation != null)
+                    ? light.map_rotation
+                    : (mapping && mapping.map_rotation);
+            return normalizeMapRotation(raw);
+        }
+
+        function rotateMapPoint(x, y, degrees) {
+            const rad = (Number(degrees) || 0) * Math.PI / 180;
+            const cos = Math.cos(rad);
+            const sin = Math.sin(rad);
+            return [x * cos + y * sin, -x * sin + y * cos];
+        }
+
+        function rotationOptions(selected) {
+            let html = '';
+            for (let angle = 0; angle < 360; angle += 15) {
+                html += `<option value="${angle}" ${angle === selected ? 'selected' : ''}>${angle}°</option>`;
+            }
+            return html;
+        }
+
+        function panelShapeKind(shapeType) {
+            if ([2, 3, 4].includes(Number(shapeType))) return 'square';
+            if ([7, 14, 15].includes(Number(shapeType))) return 'hex';
+            return 'triangle';
+        }
+
+        function panelPolygonPoints(kind, cx, cy, side, rotationDeg) {
+            const rad = (Number(rotationDeg) || 0) * Math.PI / 180;
+            const rotate = (x, y) => {
+                const cos = Math.cos(rad);
+                const sin = Math.sin(rad);
+                return [cx + x * cos - y * sin, cy + x * sin + y * cos];
+            };
+            let verts;
+            if (kind === 'square') {
+                const half = side / 2;
+                verts = [[-half, -half], [half, -half], [half, half], [-half, half]];
+            } else if (kind === 'hex') {
+                verts = [];
+                for (let i = 0; i < 6; i += 1) {
+                    const angle = (Math.PI / 180) * (60 * i - 30);
+                    verts.push([side * Math.cos(angle), side * Math.sin(angle)]);
+                }
+            } else {
+                const height = side * Math.sqrt(3) / 2;
+                verts = [[0, -height * 2 / 3], [-side / 2, height / 3], [side / 2, height / 3]];
+            }
+            return verts.map(([x, y]) => rotate(x, y).map(n => n.toFixed(1)).join(',')).join(' ');
+        }
+
+        function findLightRow(lightId) {
+            const configured = (lastLightsData.all_configured_lights || []).find(item => item.id === lightId);
+            if (configured) return configured;
+            return (lastLightsData.unconfigured_lights || []).find(item => item.id === lightId) || null;
+        }
+
+        function applyAddressingLocally(lightId, panelIds, rotation) {
+            const row = findLightRow(lightId);
+            if (!row) return;
+            row.panel_ids = panelIds;
+            row.map_rotation = rotation;
+            if (row.mapping) {
+                row.mapping.panel_ids = panelIds;
+                row.mapping.map_rotation = rotation;
+            }
+        }
+
+        async function savePanelAddressing(lightId, body) {
+            const response = await fetch('/api/lights/addressing', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ light_id: lightId, ...body })
+            });
+            const data = await validateJsonResponse(response);
+            if (!data.success) {
+                throw new Error(data.error || 'Could not save panel addressing');
+            }
+            const pending = panelRotationPending[lightId];
+            const rotation = pending != null ? pending : data.map_rotation;
+            applyAddressingLocally(lightId, data.panel_ids, rotation);
+            return data;
+        }
+
+        async function setPanelMapRotation(lightId, degrees) {
+            const next = normalizeMapRotation(degrees);
+            panelRotationPending[lightId] = next;
+            const row = findLightRow(lightId);
+            if (row) {
+                applyAddressingLocally(lightId, panelIdsFrom(row, row.mapping || {}), next);
+                renderLights(lastLightsData);
+            }
+            const previous = panelRotationSaves[lightId] || Promise.resolve();
+            const run = previous.catch(() => {}).then(async () => {
+                if (normalizeMapRotation(panelRotationPending[lightId]) !== next) {
+                    return;
+                }
+                await savePanelAddressing(lightId, { map_rotation: next });
+                if (normalizeMapRotation(panelRotationPending[lightId]) === next) {
+                    delete panelRotationPending[lightId];
+                }
+            });
+            panelRotationSaves[lightId] = run;
+            try {
+                await run;
+                renderLights(lastLightsData);
+            } catch (error) {
+                if (normalizeMapRotation(panelRotationPending[lightId]) === next) {
+                    delete panelRotationPending[lightId];
+                }
+                showNotification(error.message, true);
+            }
+        }
+
+        async function nudgePanelMap(lightId, delta) {
+            const row = findLightRow(lightId);
+            if (!row) return;
+            const base = panelRotationPending[lightId] != null
+                ? normalizeMapRotation(panelRotationPending[lightId])
+                : mapRotationFrom(row, row.mapping || {});
+            const next = (base + Number(delta) + 360) % 360;
+            await setPanelMapRotation(lightId, next);
+        }
+
+        function startPanelReaddress(lightId) {
+            const row = findLightRow(lightId);
+            if (!row) return;
+            panelAddressDraft = { lightId, assigned: {}, next: 1, total: panelLayoutFrom(row, row.mapping || {}).length };
+            renderLights(lastLightsData);
+        }
+
+        function cancelPanelReaddress() {
+            panelAddressDraft = null;
+            renderLights(lastLightsData);
+        }
+
+        async function resetPanelOrder(lightId) {
+            const row = findLightRow(lightId);
+            if (!row) return;
+            try {
+                await savePanelAddressing(lightId, {
+                    map_rotation: mapRotationFrom(row, row.mapping || {}),
+                    reset_order: true
+                });
+                panelAddressDraft = null;
+                renderLights(lastLightsData);
+            } catch (error) {
+                showNotification(error.message, true);
+            }
+        }
+
+        async function onPanelMapClick(lightId, panelId) {
+            if (!panelAddressDraft || panelAddressDraft.lightId !== lightId) return;
+            if (panelAddressDraft.busy) return;
+            const numericId = Number(panelId);
+            if (panelAddressDraft.assigned[numericId]) return;
+            panelAddressDraft.assigned[numericId] = panelAddressDraft.next;
+            panelAddressDraft.next += 1;
+            if (panelAddressDraft.next > panelAddressDraft.total) {
+                const order = Object.entries(panelAddressDraft.assigned)
+                    .sort((left, right) => left[1] - right[1])
+                    .map(([id]) => Number(id));
+                panelAddressDraft.busy = true;
+                try {
+                    await savePanelAddressing(lightId, { panel_ids: order });
+                    panelAddressDraft = null;
+                    showNotification('Pixel order saved');
+                } catch (error) {
+                    showNotification(error.message, true);
+                    if (panelAddressDraft) panelAddressDraft.busy = false;
+                    return;
+                }
+            }
+            renderLights(lastLightsData);
+        }
+
+        function onPanelMapKey(event, lightId, panelId) {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            onPanelMapClick(lightId, panelId);
+        }
+
+        function renderPanelAddressMap(light, mapping, selectedMode) {
+            const panels = panelLayoutFrom(light, mapping);
+            if (panels.length < 2) return '';
+            const rotation = mapRotationFrom(light, mapping);
+            const originX = panels.reduce((sum, panel) => sum + (Number(panel.x) || 0), 0) / panels.length;
+            const originY = panels.reduce((sum, panel) => sum + (Number(panel.y) || 0), 0) / panels.length;
+            const placed = panels.map(panel => {
+                const [rx, ry] = rotateMapPoint(
+                    (Number(panel.x) || 0) - originX,
+                    (Number(panel.y) || 0) - originY,
+                    rotation
+                );
+                return { ...panel, x: rx, y: ry, o: (Number(panel.o) || 0) + rotation };
+            });
+            const side = Number(light.side_length || mapping.side_length || 100) || 100;
+            const xs = placed.map(panel => panel.x);
+            const ys = placed.map(panel => panel.y);
+            const pad = side;
+            const minX = Math.min(...xs) - pad;
+            const maxX = Math.max(...xs) + pad;
+            const minY = Math.min(...ys) - pad;
+            const maxY = Math.max(...ys) + pad;
+            const width = Math.max(1, maxX - minX);
+            const height = Math.max(1, maxY - minY);
+            const startCh = parseInt(mapping.start_channel, 10) || 1;
+            const per = channelsPerMode(selectedMode);
+            const cells = controlCellsForMode(selectedMode, light);
+            const pixel = isPixelMode(selectedMode);
+            const draft = panelAddressDraft && panelAddressDraft.lightId === light.id ? panelAddressDraft : null;
+            const order = panelIdsFrom(light, mapping);
+            const indexById = new Map(order.map((id, index) => [Number(id), index]));
+            const shapes = placed.map(panel => {
+                const cx = panel.x - minX;
+                const cy = maxY - panel.y;
+                const points = panelPolygonPoints(
+                    panelShapeKind(panel.shapeType),
+                    cx,
+                    cy,
+                    side,
+                    panel.o
+                );
+                const assigned = draft ? draft.assigned[Number(panel.id)] : (indexById.has(Number(panel.id)) ? indexById.get(Number(panel.id)) + 1 : '');
+                const classes = [];
+                if (draft && assigned) classes.push('is-assigned');
+                if (draft && !assigned) classes.push('is-next');
+                let channelText = '';
+                if (!draft && pixel && cells > 1 && assigned) {
+                    const cell = Math.min(cells - 1, Math.floor((assigned - 1) * cells / panels.length));
+                    channelText = `<text class="panel-ch" x="${cx.toFixed(1)}" y="${(cy + side * 0.18).toFixed(1)}">${startCh + cell * per}</text>`;
+                }
+                const ariaLabel = assigned ? `Panel ${assigned}` : 'Unassigned panel';
+                return `<g tabindex="0" role="button" aria-label="${esc(ariaLabel)}" onclick="onPanelMapClick('${escJs(light.id)}', ${Number(panel.id)})" onkeydown="onPanelMapKey(event, '${escJs(light.id)}', ${Number(panel.id)})">
+                    <polygon class="${classes.join(' ')}" points="${points}"></polygon>
+                    <text class="panel-idx" x="${cx.toFixed(1)}" y="${(channelText ? cy - side * 0.08 : cy).toFixed(1)}">${assigned || ''}</text>
+                    ${channelText}
+                </g>`;
+            }).join('');
+            let hint;
+            if (draft) {
+                hint = `Click panels in pixel order. Next: ${draft.next} of ${draft.total}.`;
+            } else if (pixel && cells === panels.length) {
+                hint = 'Numbers are pixel order. Cyan is that panel’s start DMX channel.';
+            } else {
+                hint = 'Numbers are pixel order. Rotate the map to match the wall, then re-address or reset order.';
+            }
+            const actions = draft
+                ? `<div class="panel-map-actions">
+                    <button class="btn btn-small" type="button" onclick="cancelPanelReaddress()">Cancel</button>
+                   </div>`
+                : `<div class="panel-map-actions">
+                    <button class="btn btn-small" type="button" onclick="nudgePanelMap('${escJs(light.id)}', -30)">−30°</button>
+                    <button class="btn btn-small" type="button" onclick="nudgePanelMap('${escJs(light.id)}', -15)">−15°</button>
+                    <span class="panel-map-angle">${rotation}°</span>
+                    <button class="btn btn-small" type="button" onclick="nudgePanelMap('${escJs(light.id)}', 15)">+15°</button>
+                    <button class="btn btn-small" type="button" onclick="nudgePanelMap('${escJs(light.id)}', 30)">+30°</button>
+                    <select aria-label="Map rotation" onchange="setPanelMapRotation('${escJs(light.id)}', this.value)">
+                        ${rotationOptions(rotation)}
+                    </select>
+                    <button class="btn btn-small" type="button" onclick="startPanelReaddress('${escJs(light.id)}')">Re-address</button>
+                    <button class="btn btn-small" type="button" onclick="resetPanelOrder('${escJs(light.id)}')">Reset order</button>
+                   </div>`;
+            return `<div class="panel-map${draft ? ' is-addressing' : ''}">
+                <svg viewBox="0 0 ${width.toFixed(1)} ${height.toFixed(1)}" role="img" aria-label="Panel address layout">${shapes}</svg>
+                ${actions}
+                <p class="field-hint">${hint}</p>
+            </div>`;
         }
 
         function isPixelMode(mode) {
@@ -1211,23 +1629,27 @@
                     const endCh = isPixelMode(selectedMode) && cells > 1 ? startCh + per * cells - 1 : startCh + per - 1;
                     const outOfUniverse = endCh > 512;
                     const id = escJs(light.id);
+                    const vendor = vendorLabel(light);
+                    const vendorClass = light.vendor === 'nanoleaf' ? ' is-nanoleaf' : '';
                     return `
                         <article class="light-row ${rowClass}">
                             <div class="light-top">
                                 <div>
                                     <div class="light-label">${esc(light.label)}</div>
-                                    <div class="light-meta">${esc(light.ip)} · ${esc(light.model || 'Unknown model')}</div>
+                                    <div class="light-meta">${lightMetaHtml(light)}</div>
                                     <div class="light-flags">
                                         ${!isDiscovered ? '<div class="flag flag-bad">Not on the network — discover to reconnect</div>' : ''}
                                         ${!hasConfig ? '<div class="flag flag-warn">Needs universe and start channel</div>' : ''}
                                         ${outOfUniverse ? '<div class="flag flag-warn">End channel ' + endCh + ' is past 512 (out of universe)</div>' : ''}
                                     </div>
+                                    ${renderPanelAddressMap(light, mapping, selectedMode)}
                                 </div>
                                 ${hasConfig ? `<div class="chips">
+                                    <span class="chip chip-vendor${vendorClass}">${esc(vendor)}</span>
                                     <span class="chip">U ${esc(mapping.universe)}</span>
                                     <span class="chip">Ch ${esc(mapping.start_channel)}${endCh > startCh ? `–${endCh}` : ''}</span>
                                     <span class="chip chip-mode">${esc(selectedMode)}</span>
-                                </div>` : ''}
+                                </div>` : `<div class="chips"><span class="chip chip-vendor${vendorClass}">${esc(vendor)}</span></div>`}
                             </div>
                             <div class="map-form" id="edit-form-${esc(light.id)}" style="display: none;">
                                 <label class="field field-name">
@@ -1260,6 +1682,8 @@
                             </div>
                             <div id="view-mode-${esc(light.id)}" class="row-actions">
                                 <button class="btn btn-small" type="button" onclick="editMapping('${id}')">Edit</button>
+                                ${light.vendor === 'nanoleaf' && light.paired !== false ? `<button class="btn btn-small" type="button" onclick="identifyLight('${id}')">Identify</button>` : ''}
+                                ${light.vendor === 'nanoleaf' && light.paired === false ? `<button class="btn btn-primary btn-small" type="button" onclick="pairNanoleaf('${id}', this)">Pair</button>` : ''}
                                 <button class="btn btn-stop btn-small" type="button" onclick="deleteMapping('${id}')">Delete</button>
                             </div>
                         </article>
@@ -1273,15 +1697,30 @@
                 const hasMapped = allConfiguredLights.length > 0;
                 discoveredContainer.innerHTML = hasMapped
                     ? '<div class="empty">All discovered lights are mapped.</div>'
-                    : '<div class="empty"><p>Nothing waiting to be patched.</p><p class="empty-hint">Discover lights on the network, or add one by IP.</p></div>';
+                    : '<div class="empty"><p>Nothing waiting to be patched.</p><p class="empty-hint">Discover LIFX and Nanoleaf devices, or add one by IP.</p></div>';
             } else {
                 discoveredContainer.innerHTML = '<div class="light-list">' + unconfiguredLights.map(light => {
                     const id = escJs(light.id);
                     const defaultMode = 'RGB (8bit)';
+                    const vendor = vendorLabel(light);
+                    if (light.vendor === 'nanoleaf' && light.paired === false) {
+                        return `
+                        <article class="light-row is-needs-config">
+                            <div class="light-label">${esc(light.label)}</div>
+                            <div class="light-meta">${lightMetaHtml(light)}</div>
+                            <div class="pair-box">
+                                <p>Hold the controller power button for 5–7 seconds until the LED flashes, then pair. Skylight uses Connect to API in the Nanoleaf app.</p>
+                                <div class="form-actions">
+                                    <button class="btn btn-primary btn-small" type="button" onclick="pairNanoleaf('${id}', this)">Pair</button>
+                                </div>
+                            </div>
+                        </article>`;
+                    }
                     return `
                         <article class="light-row">
                             <div class="light-label">${esc(light.label)}</div>
-                            <div class="light-meta">${esc(light.ip)} · ${esc(light.model || 'Unknown model')}</div>
+                            <div class="light-meta">${lightMetaHtml(light)}</div>
+                            ${renderPanelAddressMap(light, { channel_mode: defaultMode }, defaultMode)}
                             <div class="map-form">
                                 <label class="field field-name">
                                     <span class="field-label">Name</span>
@@ -1308,11 +1747,60 @@
                                 </label>
                                 <div class="form-actions">
                                     <button class="btn btn-primary btn-small" type="button" onclick="saveMapping('${id}')">Patch</button>
+                                    ${light.vendor === 'nanoleaf' ? `<button class="btn btn-small" type="button" onclick="identifyLight('${id}')">Identify</button>` : ''}
                                 </div>
                             </div>
                         </article>
                     `;
                 }).join('') + '</div>';
+            }
+        }
+
+        async function pairNanoleaf(lightId, button) {
+            const originalLabel = button ? button.textContent : 'Pair';
+            if (button) {
+                button.disabled = true;
+                button.textContent = 'Pairing…';
+            }
+            try {
+                const response = await fetch('/api/nanoleaf/pair', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ light_id: lightId })
+                });
+                const data = await validateJsonResponse(response);
+                if (data.success) {
+                    showNotification(`Paired ${data.light.label || 'Nanoleaf'}`);
+                    loadLights();
+                    updateStatus();
+                } else {
+                    showNotification(data.error || 'Pairing failed', true);
+                }
+            } catch (error) {
+                showNotification('Error: ' + error.message, true);
+            } finally {
+                if (button) {
+                    button.disabled = false;
+                    button.textContent = originalLabel || 'Pair';
+                }
+            }
+        }
+
+        async function identifyLight(lightId) {
+            try {
+                const response = await fetch('/api/lights/identify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ light_id: lightId })
+                });
+                const data = await validateJsonResponse(response);
+                if (data.success) {
+                    showNotification(`Identifying ${data.light_label || 'Nanoleaf'}`);
+                } else {
+                    showNotification(data.error || 'Identify failed', true);
+                }
+            } catch (error) {
+                showNotification('Error: ' + error.message, true);
             }
         }
 
@@ -1663,11 +2151,13 @@
         const animationStates = {};
         let animationUpdateInterval = 400;
         const testRgbThrottle = {};
-        const ANIM_STORAGE_KEY = 'sacn2lifx-test-animations';
+        const ANIM_STORAGE_KEY = 'sacn2homelx-test-animations';
+        const ANIM_STORAGE_KEY_LEGACY = 'sacn2lifx-test-animations';
 
         function readPersistedAnimations() {
             try {
-                const parsed = JSON.parse(sessionStorage.getItem(ANIM_STORAGE_KEY) || '{}');
+                const raw = sessionStorage.getItem(ANIM_STORAGE_KEY) || sessionStorage.getItem(ANIM_STORAGE_KEY_LEGACY) || '{}';
+                const parsed = JSON.parse(raw);
                 return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
             } catch (err) {
                 return {};
@@ -1686,6 +2176,7 @@
 
         function clearPersistedAnimations() {
             sessionStorage.removeItem(ANIM_STORAGE_KEY);
+            sessionStorage.removeItem(ANIM_STORAGE_KEY_LEGACY);
         }
 
         function haltAnimationsKeepPersist() {

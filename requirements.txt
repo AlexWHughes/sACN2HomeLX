@@ -2,3 +2,4 @@ flask>=3.1.3,<4
 werkzeug>=3.1.0,<4
 sacn>=1.11.0,<2
 ifaddr>=0.2.0,<1
+zeroconf>=0.149.0,<1

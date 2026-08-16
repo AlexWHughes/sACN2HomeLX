@@ -61,6 +61,8 @@ MULTI_ZONE_NO_APPLY = 0
 EXTENDED_MZ_COLORS_PER_PACKET = 82
 SET64_COLORS_PER_PACKET = 64
 TILE_DEVICE_SIZE = 55
+LEGACY_MZ_MAX_ZONES = 256
+LEGACY_MZ_PACKET_BUDGET = 16
 
 # Canonical DMX channel-mode names (shared with app.py CHANNEL_MODE_SPEC).
 CHANNEL_MODES: Tuple[str, ...] = (
@@ -482,6 +484,7 @@ class LifxLanClient:
     ) -> List[bytes]:
         """Build SetColorZones (501) packets, one per contiguous colour run."""
         packets = []
+        colors = colors[:LEGACY_MZ_MAX_ZONES]
         if not colors:
             return packets
         runs: List[Tuple[int, int, Tuple[int, int, int, int]]] = []
@@ -493,6 +496,15 @@ class LifxLanClient:
                 start = index
                 current = colors[index]
         runs.append((start, len(colors) - 1, current))
+        while len(runs) > LEGACY_MZ_PACKET_BUDGET:
+            merged: List[Tuple[int, int, Tuple[int, int, int, int]]] = []
+            for pair_index in range(0, len(runs), 2):
+                start_index, end_index, color = runs[pair_index]
+                if pair_index + 1 < len(runs):
+                    _next_start, next_end, _next_color = runs[pair_index + 1]
+                    end_index = next_end
+                merged.append((start_index, end_index, color))
+            runs = merged
         last = len(runs) - 1
         for run_index, (start_index, end_index, color) in enumerate(runs):
             apply = MULTI_ZONE_APPLY if run_index == last else MULTI_ZONE_NO_APPLY
@@ -776,11 +788,11 @@ class LifxLanClient:
     # =========================
 
     def discover_lights(self, timeout: float = 5.0) -> List[LifxLight]:
-        """Discover all LIFX lights on the network"""
-        # Clear existing lights at start of discovery to avoid duplicates
-        with self.lock:
-            self.lights.clear()
-        
+        """Discover all LIFX lights on the network.
+
+        Known lights are kept. A failed or empty scan must not drop bulbs that
+        were already online (for example while Nanoleaf mDNS runs next).
+        """
         # Send broadcast discovery
         header = self._build_header(GET_SERVICE, tagged=True)
         packet = self._finalise(header)
