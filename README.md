@@ -50,7 +50,7 @@ What happens:
 
 1. The first run creates a local `.venv` and installs packages. That can take a minute. Later runs reuse it.
 2. Your browser should open to `http://localhost:5001`. If it does not, open that address yourself.
-3. Leave the terminal window open while you use the app. Close it or press Ctrl+C to quit.
+3. Leave the terminal window open while you use the app. Press Ctrl+C to quit. Double-clicking `start.command` (macOS) or `start.bat` (Windows) closes that window when the app stops.
 
 The first time, macOS or Windows may ask for network permission. Allow it so LIFX, Nanoleaf, and sACN can work.
 
@@ -142,10 +142,10 @@ sACN2HomeLX talks to Nanoleaf over the [Light Panels Open API](https://nanoleaf.
 | --- | --- | --- |
 | Light Panels (Aurora) | NL22 | Stream v1 (1-byte panel IDs) |
 | Canvas | NL29 | Stream v2 |
-| Shapes | NL42 | Triangles, hexagons, mini triangles, and mixed layouts |
-| Blocks | NL45 | Stream v2 |
+| Shapes | NL42 | Triangles, hexagons, mini triangles; map draws each shape at its real size |
+| Blocks | NL45, NL81 | Squares on the panel map |
 | Elements | NL52 | Stream v2 |
-| Lines | NL59 | Stream v2 |
+| Lines | NL59 | Bars on the panel map, not triangles |
 | Essentials | NL64 | If it advertises the Open API |
 | 4D | NL67 | If it advertises the Open API |
 | Skylight | NL69 | Pair from the Nanoleaf app, not the hardware button |
@@ -173,7 +173,7 @@ Rhythm modules, Shapes controller tiles, Lines connectors, and power/controller 
 
 ### Pair a Nanoleaf
 
-You pair **once per controller**. The token is stored in `config.json` under `settings.nanoleaf_auth`. Treat it like a password. It survives app restarts and unmapping the fixture until the controller is factory-reset.
+You pair **once per controller**. The token is stored locally in gitignored `config.json` under `settings.nanoleaf_auth`. You can also supply tokens via the `NANOLEAF_AUTH` environment variable (JSON object of device id → `{auth_token, ip, port}`) or an untracked secrets file (`nanoleaf_auth.json`, or the path in `NANOLEAF_AUTH_FILE`). Treat the token like a password. It survives app restarts and unmapping the fixture until the controller is factory-reset.
 
 #### Shapes, Canvas, Light Panels, Elements, Lines, Blocks
 
@@ -362,7 +362,7 @@ Mappings and settings are automatically saved to `config.json` in the project di
 - Light mappings (universe, start channel, brightness, channel mode)
 - Network interface settings (discovery and sACN interfaces)
 - Light labels and IP addresses
-- Nanoleaf auth tokens (`settings.nanoleaf_auth`) — treat these like passwords; they last until the controller is factory-reset
+- Nanoleaf auth tokens (`settings.nanoleaf_auth` in local `config.json`, or `NANOLEAF_AUTH` / `nanoleaf_auth.json`) — treat these like passwords; they last until the controller is factory-reset. Copy `configHome.example.json` for a placeholder-only template; do not commit real tokens.
 
 You can reload the configuration without restarting the application using the "Reload Config" button.
 

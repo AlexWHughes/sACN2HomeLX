@@ -4,10 +4,12 @@ Unit tests for app.py - focusing on _restart_dmx_if_running function
 import unittest
 from unittest.mock import Mock, MagicMock, patch, call
 from types import SimpleNamespace
+import json
+import os
+import sys
+import tempfile
 import threading
 import time
-import sys
-import os
 
 # Add parent directory to path to import app module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -610,6 +612,7 @@ class TestListLightsApi(unittest.TestCase):
         self.assertFalse(row['paired'])
         self.assertTrue(row['zone_capable'])
         self.assertEqual(len(row['panel_layout']), 4)
+        self.assertEqual(row['model'], 'Shapes: Triangle')
         self.assertIn('RGB Full Pixel (8bit)', row['supported_modes'])
 
     def test_list_lights_hydrates_nanoleaf_layout_onto_mapping(self):
@@ -912,6 +915,38 @@ class TestListLightsApi(unittest.TestCase):
             })
         self.assertEqual(custom.get_json()['panel_ids'], [2, 1, 4, 3])
         self.assertEqual(app.light_mappings['nl_shapes']['panel_ids'], [2, 1, 4, 3])
+        with patch.object(app, 'save_config'):
+            angled = self.client.post('/api/lights/addressing', json={
+                'light_id': 'nl_shapes',
+                'panel_orientations': {'2': 45, '9': 15},
+            })
+        self.assertTrue(angled.get_json()['success'], angled.get_json())
+        self.assertEqual(angled.get_json()['panel_orientations'], {'2': 45})
+        self.assertEqual(app.light_mappings['nl_shapes']['panel_orientations'], {'2': 45})
+
+    def test_update_panel_addressing_orientations_without_mapping(self):
+        from nanoleaf_client import NanoleafDevice
+        device = NanoleafDevice('nl_shapes', '192.168.1.115', auth_token='tok', label='Shapes', model='NL42')
+        device.panel_layout = [
+            {'id': 1, 'x': 0, 'y': 100},
+            {'id': 3, 'x': 100, 'y': 100},
+            {'id': 4, 'x': 0, 'y': 0},
+            {'id': 2, 'x': 100, 'y': 0},
+        ]
+        device.panel_ids = [1, 3, 4, 2]
+        mock_nl = Mock()
+        mock_nl.get_device.return_value = device
+        app.nanoleaf_client = mock_nl
+        app.light_mappings = {}
+        with patch.object(app, 'save_config'):
+            resp = self.client.post('/api/lights/addressing', json={
+                'light_id': 'nl_shapes',
+                'panel_orientations': {'2': 45, '9': 15},
+            })
+        self.assertTrue(resp.get_json()['success'], resp.get_json())
+        self.assertEqual(resp.get_json()['panel_orientations'], {'2': 45})
+        self.assertEqual(device.panel_orientations, {'2': 45})
+        self.assertNotIn('nl_shapes', app.light_mappings)
 
     def test_update_panel_addressing_rejects_non_numeric_layout_ids(self):
         app.nanoleaf_client = Mock()
@@ -932,6 +967,23 @@ class TestListLightsApi(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(resp.get_json()['success'])
         self.assertIn('non-numeric', resp.get_json()['error'])
+
+    def test_identify_light_can_target_one_panel(self):
+        from nanoleaf_client import NanoleafDevice
+        device = NanoleafDevice('nl_lines', '192.168.1.90', auth_token='tok', label='Lines', model='NL59')
+        mock_nl = Mock()
+        mock_nl.get_device.return_value = device
+        app.nanoleaf_client = mock_nl
+        resp = self.client.post('/api/lights/identify', json={
+            'light_id': 'nl_lines',
+            'panel_id': 18,
+        })
+        self.assertTrue(resp.get_json()['success'], resp.get_json())
+        mock_nl.identify_panel.assert_called_once_with(device, 18)
+        mock_nl.identify.assert_not_called()
+        whole = self.client.post('/api/lights/identify', json={'light_id': 'nl_lines'})
+        self.assertTrue(whole.get_json()['success'])
+        mock_nl.identify.assert_called_once_with(device)
 
     def test_list_lights_keeps_lifx_online_when_nanoleaf_is_present(self):
         from lifx_client import LifxLight
@@ -1301,6 +1353,9 @@ class TestPixelMapping(unittest.TestCase):
         rainbow = app._pixel_test_commands(light, 'rainbow', 1.0)
         self.assertEqual(len(rainbow), 55)
         self.assertNotEqual(rainbow[0][:3], rainbow[-1][:3])
+        shifted = app._pixel_test_commands(light, 'rainbow', 1.0, chase_index=1)
+        self.assertEqual(rainbow[0][:3], shifted[1][:3])
+        self.assertNotEqual(rainbow[0][:3], shifted[0][:3])
         rows = app._pixel_test_commands(light, 'rows', 1.0)
         self.assertEqual(rows[0][:3], rows[4][:3])
         self.assertNotEqual(rows[0][:3], rows[5][:3])
@@ -1309,9 +1364,9 @@ class TestPixelMapping(unittest.TestCase):
         self.assertNotEqual(cols[0][:3], cols[1][:3])
         grouped = app._pixel_test_commands(light, '8', 1.0)
         self.assertEqual(len(grouped), 55)
-        chase = app._pixel_test_commands(light, 'chase', 1.0, chase_index=3, chase_rgb=(1.0, 0.0, 0.0))
-        self.assertEqual(chase[3][:3], (1.0, 0.0, 0.0))
-        self.assertEqual(chase[0][:3], (0.0, 0.0, 0.0))
+        chase = app._pixel_test_commands(light, 'chase', 1.0, chase_index=3)
+        self.assertEqual(chase[3][:3], app.PIXEL_CHASE_HIGHLIGHT)
+        self.assertEqual(chase[0][:3], app.PIXEL_CHASE_LOWLIGHT)
 
     def test_standard_fixture_has_no_pixel_tests(self):
         from lifx_client import LifxLight
@@ -1794,6 +1849,49 @@ class TestBatchDrainDuration(unittest.TestCase):
         )
         self.assertEqual(app._nl_perf_metrics['drain_overrun_count'], self._nl_overrun + 1)
         self.assertEqual(app._perf_metrics['drain_overrun_count'], self._overrun)
+
+
+class TestNanoleafAuthSecrets(unittest.TestCase):
+    def setUp(self):
+        self._mappings = dict(app.light_mappings)
+        self._auth = dict(app.nanoleaf_auth)
+        self._lifx = app.lifx_interface
+        self._sacn = app.sacn_interface
+
+    def tearDown(self):
+        app.light_mappings = self._mappings
+        app.nanoleaf_auth = self._auth
+        app.lifx_interface = self._lifx
+        app.sacn_interface = self._sacn
+
+    def test_load_config_overlays_env_and_secrets_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, 'config.json')
+            secrets_path = os.path.join(tmp, 'nanoleaf_auth.json')
+            with open(config_path, 'w') as handle:
+                json.dump({'mappings': {}, 'settings': {'nanoleaf_auth': {}}}, handle)
+            with open(secrets_path, 'w') as handle:
+                json.dump({
+                    'nl_file': {
+                        'auth_token': 'from-file',
+                        'ip': '10.0.0.8',
+                        'port': 16021,
+                    }
+                }, handle)
+            env_auth = json.dumps({
+                'nl_env': {
+                    'auth_token': 'from-env',
+                    'ip': '10.0.0.9',
+                    'port': 16021,
+                }
+            })
+            with patch.object(app, 'CONFIG_FILE', config_path), patch.dict(os.environ, {
+                'NANOLEAF_AUTH_FILE': secrets_path,
+                'NANOLEAF_AUTH': env_auth,
+            }):
+                app.load_config()
+        self.assertEqual(app.nanoleaf_auth['nl_file']['auth_token'], 'from-file')
+        self.assertEqual(app.nanoleaf_auth['nl_env']['auth_token'], 'from-env')
 
 
 if __name__ == '__main__':

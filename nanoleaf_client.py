@@ -17,7 +17,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from nanoleaf_products import (
     NON_LIGHT_SHAPE_TYPES,
     StreamVersion,
-    product_name,
+    infer_side_length,
+    layout_product_name,
     stream_version_for_model,
 )
 
@@ -83,6 +84,7 @@ class NanoleafDevice:
         self.panel_ids: List[int] = []
         self.panel_layout: List[Dict[str, int]] = []
         self.map_rotation = 0
+        self.panel_orientations: Dict[str, int] = {}
         self.side_length = 100
         self.matrix_width = 1
         self.matrix_height = 1
@@ -98,7 +100,15 @@ class NanoleafDevice:
 
     @property
     def model_name(self) -> str:
-        return product_name(self.model)
+        types = []
+        for panel in self.panel_layout:
+            if 'shapeType' not in panel:
+                continue
+            try:
+                types.append(int(panel['shapeType']))
+            except (TypeError, ValueError):
+                continue
+        return layout_product_name(self.model, types)
 
     @property
     def stream_version(self) -> StreamVersion:
@@ -442,6 +452,7 @@ class NanoleafClient:
             except OSError as exc:
                 print(f'Nanoleaf UDP bind failed for {bind_host}: {exc}')
         self._last_stream: Dict[str, float] = {}
+        self._last_frames: Dict[str, List[Tuple[int, int, int, int, int]]] = {}
         self._pending_stream: Dict[str, List[Tuple[int, int, int, int, int]]] = {}
 
     def get_devices(self) -> List[NanoleafDevice]:
@@ -572,10 +583,9 @@ class NanoleafClient:
             device.matrix_height = height
             device.layout = kind
             device.panel_ids = merge_panel_order(previous_ids, positions, device.map_rotation)
-            try:
-                device.side_length = int(layout.get('sideLength') or device.side_length)
-            except (TypeError, ValueError):
-                pass
+            device.side_length = infer_side_length(
+                layout, positions, device.model, device.side_length
+            )
         self.remember(device)
         return device
 
@@ -644,6 +654,123 @@ class NanoleafClient:
         if not device.auth_token:
             raise NanoleafError('Device is not paired')
         _http_json('PUT', f'{device.base_url}/{device.auth_token}/identify')
+
+    def identify_panel(self, device: NanoleafDevice, panel_id: int, wait: bool = False) -> None:
+        """Flash one panel so it can be matched on the wall."""
+        if not device.auth_token:
+            raise NanoleafError('Device is not paired')
+        try:
+            target = int(panel_id)
+        except (TypeError, ValueError) as exc:
+            raise NanoleafError('panel_id must be an integer') from exc
+        self.ensure_layout(device)
+        panel_ids = [int(panel['id']) for panel in device.panel_layout] or list(device.panel_ids)
+        if target not in set(panel_ids):
+            raise NanoleafError(f'Unknown panel {target}')
+        was_streaming = bool(device.ext_control_active)
+        prior_frame = self._prior_stream_frame(device) if was_streaming else None
+        rest_state = None if prior_frame is not None else self._snapshot_rest_state(device)
+        self.prepare_streaming(device)
+        if not device.ext_control_active:
+            raise NanoleafError('Could not start external control for identify')
+
+        def _flash() -> None:
+            others = [(pid, 12, 12, 12, 1) for pid in panel_ids if pid != target]
+            on_frame = others + [(target, 255, 255, 255, 1)]
+            off_frame = others + [(target, 0, 0, 0, 1)]
+            try:
+                for _ in range(3):
+                    self._stream(device, on_frame, force=True)
+                    time.sleep(0.22)
+                    self._stream(device, off_frame, force=True)
+                    time.sleep(0.14)
+            finally:
+                self._restore_identify_output(device, prior_frame, rest_state)
+
+        worker = threading.Thread(target=_flash, daemon=True, name='nl_identify_panel')
+        worker.start()
+        if wait:
+            worker.join(timeout=2.5)
+
+    def _prior_stream_frame(
+        self,
+        device: NanoleafDevice,
+    ) -> Optional[List[Tuple[int, int, int, int, int]]]:
+        with self.lock:
+            pending = self._pending_stream.get(device.id)
+            last = self._last_frames.get(device.id)
+            frame = pending or last
+            return list(frame) if frame else None
+
+    def _snapshot_rest_state(self, device: NanoleafDevice) -> Optional[dict]:
+        if not device.auth_token:
+            return None
+        try:
+            _status, body = _http_json('GET', f'{device.base_url}/{device.auth_token}')
+        except NanoleafError:
+            return None
+        state = (body or {}).get('state') or {}
+        effects = (body or {}).get('effects') or {}
+        return {
+            'on': (state.get('on') or {}).get('value'),
+            'brightness': (state.get('brightness') or {}).get('value'),
+            'hue': (state.get('hue') or {}).get('value'),
+            'sat': (state.get('sat') or {}).get('value'),
+            'ct': (state.get('ct') or {}).get('value'),
+            'colorMode': state.get('colorMode'),
+            'effect': effects.get('select'),
+        }
+
+    def _restore_identify_output(
+        self,
+        device: NanoleafDevice,
+        prior_frame: Optional[Sequence[Tuple[int, int, int, int, int]]],
+        rest_state: Optional[dict],
+    ) -> None:
+        if prior_frame:
+            self._stream(device, prior_frame, force=True)
+            return
+        self._restore_rest_state(device, rest_state)
+
+    def _restore_rest_state(self, device: NanoleafDevice, snapshot: Optional[dict]) -> None:
+        """Leave external control and put the fixture back on its previous REST output."""
+        if snapshot:
+            color_mode = snapshot.get('colorMode')
+            effect = snapshot.get('effect')
+            if (
+                color_mode == 'effect'
+                and isinstance(effect, str)
+                and effect
+                and effect not in ('*ExtControl*', 'ExtControl', '*Solid*')
+            ):
+                try:
+                    _http_json(
+                        'PUT',
+                        f'{device.base_url}/{device.auth_token}/effects',
+                        {'select': effect},
+                    )
+                    device.ext_control_active = False
+                    return
+                except NanoleafError as exc:
+                    print(f'Nanoleaf effect restore failed for {device.label or device.ip}: {exc}')
+            body: dict = {}
+            if snapshot.get('on') is not None:
+                body['on'] = {'value': bool(snapshot['on'])}
+            if snapshot.get('brightness') is not None:
+                body['brightness'] = {'value': int(snapshot['brightness'])}
+            if color_mode == 'ct' and snapshot.get('ct') is not None:
+                body['ct'] = {'value': int(snapshot['ct'])}
+            else:
+                if snapshot.get('hue') is not None:
+                    body['hue'] = {'value': int(snapshot['hue'])}
+                if snapshot.get('sat') is not None:
+                    body['sat'] = {'value': int(snapshot['sat'])}
+            if body:
+                try:
+                    self._put_state(device, body)
+                except NanoleafError as exc:
+                    print(f'Nanoleaf state restore failed for {device.label or device.ip}: {exc}')
+        device.ext_control_active = False
 
     def enable_ext_control(self, device: NanoleafDevice) -> None:
         if not device.auth_token:
@@ -737,6 +864,7 @@ class NanoleafClient:
         self,
         device: NanoleafDevice,
         panels: Sequence[Tuple[int, int, int, int, int]],
+        force: bool = False,
     ) -> None:
         if not device.ext_control_active:
             return
@@ -744,7 +872,7 @@ class NanoleafClient:
         outgoing = list(panels)
         with self.lock:
             last = self._last_stream.get(device.id, 0.0)
-            if now - last < MIN_STREAM_INTERVAL:
+            if not force and now - last < MIN_STREAM_INTERVAL:
                 self._pending_stream[device.id] = outgoing
                 return
             self._pending_stream.pop(device.id, None)
@@ -756,6 +884,7 @@ class NanoleafClient:
             print(f'Nanoleaf UDP send failed for {device.ip}: {exc}')
             return
         with self.lock:
+            self._last_frames[device.id] = outgoing
             pending = self._pending_stream.get(device.id)
             if pending is None or pending == outgoing:
                 self._pending_stream.pop(device.id, None)

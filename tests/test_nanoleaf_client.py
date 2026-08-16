@@ -15,7 +15,14 @@ from nanoleaf_client import (
     parse_layout,
     rotate_point,
 )
-from nanoleaf_products import product_name, stream_version_for_model
+from nanoleaf_products import (
+    infer_side_length,
+    layout_product_name,
+    product_name,
+    shape_kind,
+    shape_side_length,
+    stream_version_for_model,
+)
 
 
 class TestNanoleafProducts(unittest.TestCase):
@@ -35,6 +42,37 @@ class TestNanoleafProducts(unittest.TestCase):
         self.assertEqual(stream_version_for_model('NL22'), 'v1')
         self.assertEqual(stream_version_for_model('NL29'), 'v2')
         self.assertEqual(stream_version_for_model('NL52'), 'v2')
+
+    def test_blocks_and_lines_model_names(self):
+        self.assertEqual(product_name('NL59'), 'Lines')
+        self.assertEqual(product_name('NL81'), 'Blocks')
+        self.assertEqual(layout_product_name('NL81', []), 'Blocks: Squares')
+        self.assertEqual(layout_product_name('NL42', [8, 8]), 'Shapes: Triangle')
+        self.assertEqual(layout_product_name('NL42', [7, 7]), 'Shapes: Hexagon')
+        self.assertEqual(layout_product_name('NL42', [8, 7]), 'Shapes: Mixed')
+        self.assertEqual(layout_product_name('NL59', [17, 18]), 'Lines')
+
+    def test_shape_kind_and_side(self):
+        self.assertEqual(shape_kind(8), 'triangle')
+        self.assertEqual(shape_kind(7), 'hex')
+        self.assertEqual(shape_kind(17), 'line')
+        self.assertEqual(shape_kind(99, 'NL81'), 'square')
+        self.assertEqual(shape_side_length(8), 134)
+        self.assertEqual(shape_side_length(7), 67)
+        self.assertEqual(shape_side_length(18), 77)
+        self.assertEqual(shape_side_length(99, 0, 'NL81'), 134)
+
+    def test_skylight_controller_types_keep_180_side(self):
+        self.assertEqual(shape_side_length(30), 180)
+        for shape_type in (31, 32):
+            self.assertEqual(shape_side_length(shape_type, 50, 'NL69'), 180)
+            self.assertEqual(shape_kind(shape_type), 'square')
+            self.assertEqual(shape_kind(shape_type, 'NL69'), 'square')
+
+    def test_infer_side_length_uses_shape_when_deprecated_zero(self):
+        panels = [{'shapeType': 8}, {'shapeType': 7}]
+        self.assertEqual(infer_side_length({'sideLength': 0}, panels, 'NL42'), 134)
+        self.assertEqual(infer_side_length({'sideLength': 154}, panels, 'NL59'), 154)
 
 
 class TestNanoleafIdsAndLayout(unittest.TestCase):
@@ -87,6 +125,38 @@ class TestNanoleafIdsAndLayout(unittest.TestCase):
         self.assertEqual(kind, 'linear')
         self.assertEqual([panel['id'] for panel in panels], [8954, 64823])
         self.assertEqual(panels[0]['o'], 0)
+
+    def test_parse_layout_keeps_lines_skips_connectors(self):
+        layout = {
+            'sideLength': 154,
+            'positionData': [
+                {'panelId': 15376, 'x': 227, 'y': 337, 'o': 0, 'shapeType': 20},
+                {'panelId': 10400, 'x': 185, 'y': 313, 'o': 300, 'shapeType': 17},
+                {'panelId': 56841, 'x': 227, 'y': 289, 'o': 0, 'shapeType': 18},
+                {'panelId': 24127, 'x': 227, 'y': 164, 'o': 120, 'shapeType': 16},
+                {'panelId': 12105, 'x': 227, 'y': 212, 'o': 0, 'shapeType': 18},
+                {'panelId': 5591, 'x': 227, 'y': 337, 'o': 0, 'shapeType': 19},
+            ]
+        }
+        panels, width, height, kind = parse_layout(layout)
+        self.assertEqual(kind, 'linear')
+        self.assertEqual((width, height), (3, 1))
+        self.assertEqual([panel['id'] for panel in panels], [10400, 56841, 12105])
+        self.assertEqual([panel['shapeType'] for panel in panels], [17, 18, 18])
+
+    def test_parse_layout_keeps_shapes_hexagons(self):
+        layout = {
+            'sideLength': 0,
+            'positionData': [
+                {'panelId': 10, 'x': 0, 'y': 67, 'o': 0, 'shapeType': 7},
+                {'panelId': 11, 'x': 116, 'y': 0, 'o': 0, 'shapeType': 7},
+                {'panelId': 0, 'x': 58, 'y': 33, 'o': 0, 'shapeType': 12},
+            ]
+        }
+        panels, _width, _height, kind = parse_layout(layout)
+        self.assertEqual(kind, 'linear')
+        self.assertEqual([panel['id'] for panel in panels], [10, 11])
+        self.assertEqual([panel['shapeType'] for panel in panels], [7, 7])
 
 
 class TestPanelAddressing(unittest.TestCase):
@@ -147,6 +217,22 @@ class TestStreamFrames(unittest.TestCase):
 
 
 class TestNanoleafDevice(unittest.TestCase):
+    def test_model_name_uses_layout_shape(self):
+        triangles = NanoleafDevice('nl_tri', '10.0.0.1', model='NL42')
+        triangles.panel_layout = [
+            {'id': 1, 'x': 0, 'y': 0, 'shapeType': 8},
+            {'id': 2, 'x': 67, 'y': 0, 'shapeType': 8},
+        ]
+        self.assertEqual(triangles.model_name, 'Shapes: Triangle')
+        hexes = NanoleafDevice('nl_hex', '10.0.0.2', model='NL42')
+        hexes.panel_layout = [{'id': 1, 'x': 0, 'y': 0, 'shapeType': 7}]
+        self.assertEqual(hexes.model_name, 'Shapes: Hexagon')
+        lines = NanoleafDevice('nl_ln', '10.0.0.3', model='NL59')
+        lines.panel_layout = [{'id': 1, 'x': 0, 'y': 0, 'shapeType': 18}]
+        self.assertEqual(lines.model_name, 'Lines')
+        blocks = NanoleafDevice('nl_blk', '10.0.0.4', model='NL81')
+        self.assertEqual(blocks.model_name, 'Blocks: Squares')
+
     def test_zone_fields_from_panels(self):
         device = NanoleafDevice('abc', '192.168.1.20', model='NL29')
         self.assertEqual(device.id, 'nl_abc')
@@ -249,6 +335,98 @@ class TestSendColorLayout(unittest.TestCase):
         self.assertNotIn(device.id, client._pending_stream)
         self.assertGreater(MIN_STREAM_INTERVAL, 0)
         self.assertLess(MIN_STREAM_INTERVAL, 1.0 / 10)
+
+
+class TestIdentifyPanel(unittest.TestCase):
+    def test_identify_panel_streams_only_target_bright(self):
+        from nanoleaf_client import NanoleafClient, NanoleafDevice
+        client = NanoleafClient()
+        self.addCleanup(client.close)
+        device = NanoleafDevice('nl_x', '127.0.0.1', auth_token='tok', model='NL59')
+        device.ext_control_active = True
+        device.panel_layout = [
+            {'id': 10, 'x': 0, 'y': 0, 'shapeType': 18},
+            {'id': 11, 'x': 77, 'y': 0, 'shapeType': 18},
+        ]
+        streamed = []
+
+        def capture(_device, panels, force=False):
+            streamed.append((list(panels), force))
+
+        with patch.object(client, 'ensure_layout', return_value=device), patch.object(client, 'prepare_streaming'), patch.object(client, '_snapshot_rest_state', return_value=None), patch.object(client, '_restore_rest_state'), patch.object(client, '_stream', side_effect=capture), patch('nanoleaf_client.time.sleep'):
+            client.identify_panel(device, 11, wait=True)
+        self.assertTrue(streamed)
+        self.assertTrue(streamed[0][1])
+        by_id = {row[0]: row[1:] for row in streamed[0][0]}
+        self.assertEqual(by_id[11][:3], (255, 255, 255))
+        self.assertLess(by_id[10][0], 40)
+
+    def test_identify_panel_restores_prior_stream_frame(self):
+        from nanoleaf_client import NanoleafClient, NanoleafDevice
+        client = NanoleafClient()
+        self.addCleanup(client.close)
+        device = NanoleafDevice('nl_x', '127.0.0.1', auth_token='tok', model='NL59')
+        device.ext_control_active = True
+        device.panel_layout = [
+            {'id': 10, 'x': 0, 'y': 0, 'shapeType': 18},
+            {'id': 11, 'x': 77, 'y': 0, 'shapeType': 18},
+        ]
+        prior = [(10, 1, 2, 3, 1), (11, 4, 5, 6, 1)]
+        client._last_frames[device.id] = list(prior)
+        streamed = []
+
+        def capture(_device, panels, force=False):
+            streamed.append(list(panels))
+
+        with patch.object(client, 'ensure_layout', return_value=device), patch.object(client, 'prepare_streaming'), patch.object(client, '_stream', side_effect=capture), patch('nanoleaf_client.time.sleep'):
+            client.identify_panel(device, 11, wait=True)
+        self.assertEqual(streamed[-1], prior)
+        self.assertTrue(device.ext_control_active)
+
+    def test_identify_panel_restores_rest_state_without_prior_frame(self):
+        from nanoleaf_client import NanoleafClient, NanoleafDevice
+        client = NanoleafClient()
+        self.addCleanup(client.close)
+        device = NanoleafDevice('nl_x', '127.0.0.1', auth_token='tok', model='NL59')
+        device.panel_layout = [
+            {'id': 10, 'x': 0, 'y': 0, 'shapeType': 18},
+            {'id': 11, 'x': 77, 'y': 0, 'shapeType': 18},
+        ]
+        snapshot = {
+            'on': True,
+            'brightness': 40,
+            'hue': 12,
+            'sat': 80,
+            'colorMode': 'hs',
+        }
+        streamed = []
+
+        def capture(_device, panels, force=False):
+            streamed.append(list(panels))
+
+        def prepare(dev):
+            dev.ext_control_active = True
+
+        with patch.object(client, 'ensure_layout', return_value=device), patch.object(client, 'prepare_streaming', side_effect=prepare), patch.object(client, '_snapshot_rest_state', return_value=snapshot), patch.object(client, '_put_state') as put_state, patch.object(client, '_stream', side_effect=capture), patch('nanoleaf_client.time.sleep'):
+            client.identify_panel(device, 11, wait=True)
+        put_state.assert_called_once()
+        body = put_state.call_args.args[1]
+        self.assertEqual(body['on']['value'], True)
+        self.assertEqual(body['brightness']['value'], 40)
+        self.assertEqual(body['hue']['value'], 12)
+        self.assertFalse(device.ext_control_active)
+        last_by_id = {row[0]: row[1:] for row in streamed[-1]}
+        self.assertNotEqual(last_by_id[11][:3], (255, 255, 255))
+
+    def test_identify_panel_rejects_unknown(self):
+        from nanoleaf_client import NanoleafClient, NanoleafDevice, NanoleafError
+        client = NanoleafClient()
+        self.addCleanup(client.close)
+        device = NanoleafDevice('nl_x', '127.0.0.1', auth_token='tok', model='NL59')
+        device.panel_layout = [{'id': 10, 'x': 0, 'y': 0, 'shapeType': 18}]
+        with patch.object(client, 'ensure_layout', return_value=device):
+            with self.assertRaises(NanoleafError):
+                client.identify_panel(device, 99)
 
 
 class TestEnsureLayout(unittest.TestCase):

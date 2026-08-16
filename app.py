@@ -432,7 +432,7 @@ def load_config():
                 light_mappings = {}
                 lifx_interface = None
                 sacn_interface = None
-                nanoleaf_auth = {}
+                nanoleaf_auth = _load_nanoleaf_auth_secrets()
                 invalidate_dmx_mapping_cache()
                 return
             
@@ -442,18 +442,19 @@ def load_config():
             lifx_interface = settings.get('lifx_interface', None)
             sacn_interface = settings.get('sacn_interface', None)
             nanoleaf_auth = _sanitize_nanoleaf_auth(settings.get('nanoleaf_auth', {}))
+            nanoleaf_auth.update(_load_nanoleaf_auth_secrets())
             _import_nanoleaf_tokens_from_mappings()
     except FileNotFoundError:
         light_mappings = {}
         lifx_interface = None
         sacn_interface = None
-        nanoleaf_auth = {}
+        nanoleaf_auth = _load_nanoleaf_auth_secrets()
     except (json.JSONDecodeError, ValueError) as e:
         print(f"Warning: Error parsing config.json: {e}. Using empty configuration.")
         light_mappings = {}
         lifx_interface = None
         sacn_interface = None
-        nanoleaf_auth = {}
+        nanoleaf_auth = _load_nanoleaf_auth_secrets()
     invalidate_dmx_mapping_cache()
 
 
@@ -507,6 +508,34 @@ def _sanitize_nanoleaf_auth(raw) -> Dict[str, Dict]:
             'port': port_int,
         }
     return cleaned
+
+
+def _nanoleaf_auth_file_path() -> str:
+    return os.getenv('NANOLEAF_AUTH_FILE', 'nanoleaf_auth.json')
+
+
+def _load_nanoleaf_auth_secrets() -> Dict[str, Dict]:
+    """Auth tokens from an untracked secrets file and/or NANOLEAF_AUTH JSON."""
+    merged: Dict[str, Dict] = {}
+    path = _nanoleaf_auth_file_path()
+    try:
+        with open(path, 'r') as handle:
+            raw = json.loads(handle.read() or '{}')
+        if isinstance(raw, dict) and isinstance(raw.get('nanoleaf_auth'), dict):
+            raw = raw.get('nanoleaf_auth')
+        merged.update(_sanitize_nanoleaf_auth(raw))
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f'Warning: Error reading Nanoleaf auth file {path}: {exc}')
+    env_raw = os.getenv('NANOLEAF_AUTH')
+    if env_raw:
+        try:
+            parsed = json.loads(env_raw)
+            merged.update(_sanitize_nanoleaf_auth(parsed))
+        except json.JSONDecodeError as exc:
+            print(f'Warning: Invalid NANOLEAF_AUTH JSON: {exc}')
+    return merged
 
 
 def _import_nanoleaf_tokens_from_mappings() -> None:
@@ -581,6 +610,32 @@ def _panel_ids_from_layout(layout: Sequence) -> Tuple[List[int], Optional[str]]:
     return ids, None
 
 
+def _sanitize_panel_orientations(raw, known_ids: Optional[Sequence] = None) -> Dict[str, int]:
+    """Keep extra per-panel map rotations, snapped to 15°, keyed by panel id."""
+    if not isinstance(raw, dict):
+        return {}
+    known = None
+    if known_ids is not None:
+        known = set()
+        for item in known_ids:
+            try:
+                known.add(int(item))
+            except (TypeError, ValueError):
+                continue
+    cleaned: Dict[str, int] = {}
+    for key, value in raw.items():
+        try:
+            panel_id = int(key)
+            degrees = normalize_map_rotation(value)
+        except (TypeError, ValueError):
+            continue
+        if known is not None and panel_id not in known:
+            continue
+        if degrees:
+            cleaned[str(panel_id)] = degrees
+    return cleaned
+
+
 def _write_nanoleaf_layout_to_mapping(device: NanoleafDevice) -> bool:
     """Copy live panel geometry onto a saved mapping. True if the mapping changed."""
     mapping = light_mappings.get(device.id)
@@ -602,6 +657,12 @@ def _write_nanoleaf_layout_to_mapping(device: NanoleafDevice) -> bool:
         'matrix_width': zone_fields['matrix_width'],
         'matrix_height': zone_fields['matrix_height'],
     }
+    orientations = _sanitize_panel_orientations(
+        getattr(device, 'panel_orientations', None) or mapping.get('panel_orientations'),
+        device.panel_ids,
+    )
+    if orientations or mapping.get('panel_orientations'):
+        next_values['panel_orientations'] = orientations
     if not mapping.get('label') or mapping.get('label', '').startswith('Light '):
         if device.label:
             next_values['label'] = device.label
@@ -631,6 +692,10 @@ def _hydrate_nanoleaf_devices() -> None:
         stored_layout = mapping.get('panel_layout') or []
         device.map_rotation = normalize_map_rotation(
             mapping.get('map_rotation', device.map_rotation)
+        )
+        device.panel_orientations = _sanitize_panel_orientations(
+            getattr(device, 'panel_orientations', None) or mapping.get('panel_orientations'),
+            stored_ids or device.panel_ids or None,
         )
         if not device.panel_ids and stored_ids:
             device.panel_ids = [int(panel_id) for panel_id in stored_ids]
@@ -897,6 +962,10 @@ def _light_summary(light: MappedDevice, lid: Optional[str] = None, mapping: Opti
         'panel_ids': list(getattr(light, 'panel_ids', []) or []),
         'map_rotation': normalize_map_rotation(getattr(light, 'map_rotation', 0)),
         'side_length': getattr(light, 'side_length', None),
+        'panel_orientations': _sanitize_panel_orientations(
+            (mapping or {}).get('panel_orientations') or getattr(light, 'panel_orientations', None),
+            [panel.get('id') for panel in getattr(light, 'panel_layout', []) or []],
+        ),
         **_light_zone_fields(light),
     }
 
@@ -955,9 +1024,17 @@ def _hsv_cell(hue: float, brightness: float) -> Tuple[float, float, float, int, 
     return (r, g, b, DEFAULT_KELVIN, brightness)
 
 
-def _rainbow_cells(count: int, brightness: float) -> List[Tuple[float, float, float, int, float]]:
+PIXEL_CHASE_HIGHLIGHT = (1.0, 1.0, 1.0)
+PIXEL_CHASE_LOWLIGHT = (0.12, 0.32, 0.95)
+
+
+def _rainbow_cells(
+    count: int,
+    brightness: float,
+    offset: float = 0.0,
+) -> List[Tuple[float, float, float, int, float]]:
     n = max(1, count)
-    return [_hsv_cell(i / n, brightness) for i in range(n)]
+    return [_hsv_cell(i / n - offset, brightness) for i in range(n)]
 
 
 def _pixel_test_patterns(light: Optional[MappedDevice], mapping: Optional[Dict] = None) -> List[Dict[str, str]]:
@@ -986,6 +1063,7 @@ def _pixel_test_commands(
     chase_index: int = 0,
     chase_rgb: Optional[Tuple[float, float, float]] = None,
     mapping: Optional[Dict] = None,
+    rainbow_offset: Optional[float] = None,
 ) -> List[Tuple[float, float, float, int, float]]:
     """Build per-zone colours for Test pixel patterns."""
     count, width, height = _geometry_for(light, mapping)
@@ -993,7 +1071,10 @@ def _pixel_test_commands(
         return []
     bri = clamp01(brightness)
     if pattern == 'rainbow':
-        return _rainbow_cells(count, bri)
+        n = max(1, count)
+        if rainbow_offset is None:
+            rainbow_offset = (chase_index % n) / n
+        return _rainbow_cells(count, bri, rainbow_offset)
     if pattern == 'rows':
         cells = _rainbow_cells(height if height > 1 else count, bri)
         return _expand_control_cells_to_zones(cells, count, width, height)
@@ -1001,8 +1082,9 @@ def _pixel_test_commands(
         cells = _rainbow_cells(width if width > 1 else count, bri)
         return _expand_control_cells_to_zones(cells, count, width, height)
     if pattern == 'chase':
-        on_r, on_g, on_b = chase_rgb or (1.0, 1.0, 1.0)
-        cmds = [(0.0, 0.0, 0.0, DEFAULT_KELVIN, bri) for _ in range(count)]
+        on_r, on_g, on_b = PIXEL_CHASE_HIGHLIGHT
+        off_r, off_g, off_b = PIXEL_CHASE_LOWLIGHT
+        cmds = [(off_r, off_g, off_b, DEFAULT_KELVIN, bri) for _ in range(count)]
         cmds[chase_index % count] = (on_r, on_g, on_b, DEFAULT_KELVIN, bri)
         return cmds
     if pattern.isdigit():
@@ -1075,6 +1157,10 @@ def _configured_light_row(lid: str, mapping: Dict, light: Optional[MappedDevice]
         'panel_ids': list(mapping.get('panel_ids') or []),
         'map_rotation': normalize_map_rotation(mapping.get('map_rotation', 0)),
         'side_length': mapping.get('side_length'),
+        'panel_orientations': _sanitize_panel_orientations(
+            mapping.get('panel_orientations'),
+            [panel.get('id') for panel in mapping.get('panel_layout') or []],
+        ),
         **_light_zone_fields(None, mapping),
     }
 
@@ -2153,12 +2239,21 @@ def update_mapping():
                 mapping['map_rotation'] = normalize_map_rotation(
                     getattr(matched_light, 'map_rotation', existing_mapping.get('map_rotation', 0))
                 )
+                mapping['panel_orientations'] = _sanitize_panel_orientations(
+                    getattr(matched_light, 'panel_orientations', None)
+                    or existing_mapping.get('panel_orientations'),
+                    mapping.get('panel_ids'),
+                )
                 mapping['side_length'] = getattr(matched_light, 'side_length', existing_mapping.get('side_length'))
             else:
                 mapping['port'] = existing_mapping.get('port', DEFAULT_API_PORT)
                 mapping['panel_ids'] = list(existing_mapping.get('panel_ids') or [])
                 mapping['panel_layout'] = [dict(panel) for panel in existing_mapping.get('panel_layout') or []]
                 mapping['map_rotation'] = normalize_map_rotation(existing_mapping.get('map_rotation', 0))
+                mapping['panel_orientations'] = _sanitize_panel_orientations(
+                    existing_mapping.get('panel_orientations'),
+                    mapping.get('panel_ids'),
+                )
                 mapping['side_length'] = existing_mapping.get('side_length')
         mapping.pop('auth_token', None)
         with _config_lock:
@@ -2338,19 +2433,40 @@ def update_panel_addressing():
         if not layout:
             layout = [dict(panel) for panel in device.panel_layout]
 
+    orientations = None
+    if 'panel_orientations' in data:
+        orientations = _sanitize_panel_orientations(data.get('panel_orientations'), known)
+        if device is not None:
+            device.panel_orientations = dict(orientations)
+
     if mapping is not None:
         with _config_lock:
             mapping['panel_ids'] = list(panel_ids)
             mapping['map_rotation'] = rotation
             mapping['panel_layout'] = layout
+            if orientations is not None:
+                mapping['panel_orientations'] = orientations
             light_mappings[requested_id] = mapping
             invalidate_dmx_mapping_cache()
             save_config()
 
+    if mapping is not None:
+        stored_orientations = _sanitize_panel_orientations(
+            mapping.get('panel_orientations'),
+            known,
+        )
+    elif device is not None:
+        stored_orientations = _sanitize_panel_orientations(
+            getattr(device, 'panel_orientations', None),
+            known,
+        )
+    else:
+        stored_orientations = {}
     return jsonify({
         'success': True,
         'panel_ids': list(panel_ids),
         'map_rotation': rotation,
+        'panel_orientations': stored_orientations,
     })
 
 
@@ -2368,11 +2484,20 @@ def identify_light():
         return jsonify({'success': False, 'error': 'Light not found'}), 404
     if not device.paired:
         return jsonify({'success': False, 'error': 'Pair this Nanoleaf before identifying it'}), 400
+    panel_id = data.get('panel_id')
     try:
-        nanoleaf_client.identify(device)
+        if panel_id is not None:
+            nanoleaf_client.identify_panel(device, int(panel_id))
+        else:
+            nanoleaf_client.identify(device)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'panel_id must be an integer'}), 400
     except NanoleafError as exc:
         return jsonify({'success': False, 'error': str(exc)}), 400
-    return jsonify({'success': True, 'light_label': device.label})
+    payload = {'success': True, 'light_label': device.label}
+    if panel_id is not None:
+        payload['panel_id'] = int(panel_id)
+    return jsonify(payload)
 
 
 @app.route('/api/lights/manual', methods=['POST'])
@@ -2751,6 +2876,7 @@ def test_pixels():
     g = data.get('g', 255)
     b = data.get('b', 255)
     chase_index = data.get('index', 0)
+    rainbow_offset = data.get('offset')
 
     if not requested_light_id:
         return jsonify({'success': False, 'error': 'light_id is required'}), 400
@@ -2767,6 +2893,13 @@ def test_pixels():
         chase_index = int(chase_index)
     except (TypeError, ValueError):
         chase_index = 0
+    if rainbow_offset is not None:
+        try:
+            rainbow_offset = float(rainbow_offset)
+            if not math.isfinite(rainbow_offset):
+                rainbow_offset = None
+        except (TypeError, ValueError):
+            rainbow_offset = None
     try:
         r_i, g_i, b_i = int(r), int(g), int(b)
     except (TypeError, ValueError):
@@ -2787,6 +2920,7 @@ def test_pixels():
         chase_index=chase_index,
         chase_rgb=(r_i / 255.0, g_i / 255.0, b_i / 255.0),
         mapping=light_mappings.get(requested_light_id),
+        rainbow_offset=rainbow_offset,
     )
     if not cmds:
         return jsonify({'success': False, 'error': f'Unknown pixel test pattern: {pattern}'}), 400
@@ -2795,7 +2929,8 @@ def test_pixels():
         if _device_vendor(light, light_mappings.get(requested_light_id), requested_light_id) == 'nanoleaf':
             if nanoleaf_client is None:
                 return jsonify({'success': False, 'error': 'Nanoleaf client not initialized'}), 400
-            nanoleaf_client.send_zones(light, cmds)
+            transition_tenths = max(0, min(255, int(round(fade_ms / 100.0))))
+            nanoleaf_client.send_zones(light, cmds, transition_tenths=transition_tenths)
         else:
             if lifx_client is None:
                 return jsonify({'success': False, 'error': 'LIFX client not initialized'}), 400

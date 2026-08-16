@@ -387,26 +387,73 @@
             background: var(--bg);
         }
 
+        .panel-map-viewport {
+            overflow: auto;
+            max-height: min(70vh, 480px);
+            border-radius: var(--radius);
+            background: #0a0c0e;
+        }
+
         .panel-map svg {
             display: block;
-            width: min(100%, 360px);
+            width: calc(320px * var(--map-zoom, 1));
+            max-width: none;
             height: auto;
-            max-height: 240px;
+            max-height: none;
         }
 
         .panel-map polygon {
             fill: rgba(232, 163, 58, 0.16);
             stroke: var(--amber);
             stroke-width: 3;
+            cursor: pointer;
         }
 
+        .panel-map.is-play polygon {
+            cursor: default;
+        }
+
+        .panel-map.is-edit polygon,
         .panel-map.is-addressing polygon {
             cursor: pointer;
         }
 
+        .panel-map-mode {
+            display: inline-flex;
+            margin-bottom: 8px;
+            border: 1px solid var(--line-strong);
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+
+        .panel-map-mode .btn {
+            border: 0;
+            border-radius: 0;
+        }
+
+        .panel-map-mode .btn + .btn {
+            border-left: 1px solid var(--line-strong);
+        }
+
+        .panel-map-mode .btn.is-on {
+            background: var(--amber);
+            border-color: var(--amber);
+            color: #1a1206;
+        }
+
         .panel-map polygon.is-assigned {
-            fill: rgba(61, 204, 138, 0.22);
+            fill: rgba(61, 204, 138, 0.4);
             stroke: var(--live);
+        }
+
+        .panel-map polygon.is-selected {
+            stroke: var(--text);
+            stroke-width: 5;
+        }
+
+        .panel-map polygon.is-assigned.is-selected {
+            stroke: var(--live);
+            stroke-width: 5;
         }
 
         .panel-map polygon.is-next {
@@ -445,9 +492,17 @@
             font-weight: 700;
         }
 
+        .panel-map .is-line .panel-idx {
+            font-size: 22px;
+        }
+
         .panel-map .panel-ch {
             font-size: 16px;
             fill: var(--cyan);
+        }
+
+        .panel-map .is-line .panel-ch {
+            font-size: 13px;
         }
 
         .panel-map .field-hint { margin-top: 8px; }
@@ -458,6 +513,21 @@
             align-items: center;
             gap: 6px;
             margin-top: 8px;
+        }
+
+        .panel-map-save-row {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid var(--line);
+        }
+
+        .panel-map-save-row .btn-primary {
+            min-width: 7.5em;
+        }
+
+        .panel-map-saved {
+            color: var(--live);
+            font-size: 12px;
         }
 
         .panel-map-angle {
@@ -900,7 +970,14 @@
         let lastLightsData = { all_configured_lights: [], unconfigured_lights: [] };
         let panelAddressDraft = null;
         const panelRotationPending = {};
-        const panelRotationSaves = {};
+        const panelOrientPending = {};
+        const panelMapDirty = {};
+        const panelMapSelected = {};
+        const panelMapMode = {};
+        const panelMapZoom = {};
+        const PANEL_MAP_ZOOM_MIN = 1;
+        const PANEL_MAP_ZOOM_MAX = 4;
+        const PANEL_MAP_ZOOM_STEP = 0.5;
 
         function esc(value) {
             return String(value ?? '')
@@ -1184,10 +1261,36 @@
             return html;
         }
 
-        function panelShapeKind(shapeType) {
-            if ([2, 3, 4].includes(Number(shapeType))) return 'square';
-            if ([7, 14, 15].includes(Number(shapeType))) return 'hex';
+        // Keep in sync with nanoleaf_products.SHAPE_TYPES (Open API chapter 3.3).
+        const PANEL_SHAPE_SIDES = {
+            0: 150, 2: 100, 3: 100, 4: 100,
+            7: 67, 8: 134, 9: 67,
+            14: 134, 15: 58,
+            17: 154, 18: 77, 29: 50, 30: 180, 31: 180, 32: 180
+        };
+
+        function panelShapeKind(shapeType, model) {
+            const type = Number(shapeType);
+            if ([2, 3, 4, 30, 31, 32].includes(type)) return 'square';
+            if ([7, 14, 15].includes(type)) return 'hex';
+            if ([17, 18, 29].includes(type)) return 'line';
+            if ([0, 8, 9].includes(type)) return 'triangle';
+            const name = String(model || '').toLowerCase();
+            if (name.includes('block')) return 'square';
+            if (name.includes('line')) return 'line';
+            if (name.includes('hex')) return 'hex';
             return 'triangle';
+        }
+
+        function panelSideLength(shapeType, fallback, model) {
+            const known = PANEL_SHAPE_SIDES[Number(shapeType)];
+            if (known) return known;
+            const reported = Number(fallback) || 0;
+            if (reported > 0) return reported;
+            const name = String(model || '').toLowerCase();
+            if (name.includes('block')) return 134;
+            if (name.includes('line')) return 154;
+            return 100;
         }
 
         function panelPolygonPoints(kind, cx, cy, side, rotationDeg) {
@@ -1207,6 +1310,10 @@
                     const angle = (Math.PI / 180) * (60 * i - 30);
                     verts.push([side * Math.cos(angle), side * Math.sin(angle)]);
                 }
+            } else if (kind === 'line') {
+                const halfLen = side / 2;
+                const halfW = Math.max(11, Math.min(side * 0.14, 14));
+                verts = [[-halfW, -halfLen], [halfW, -halfLen], [halfW, halfLen], [-halfW, halfLen]];
             } else {
                 const height = side * Math.sqrt(3) / 2;
                 verts = [[0, -height * 2 / 3], [-side / 2, height / 3], [side / 2, height / 3]];
@@ -1220,15 +1327,80 @@
             return (lastLightsData.unconfigured_lights || []).find(item => item.id === lightId) || null;
         }
 
-        function applyAddressingLocally(lightId, panelIds, rotation) {
+        function applyAddressingLocally(lightId, panelIds, rotation, orientations) {
             const row = findLightRow(lightId);
             if (!row) return;
             row.panel_ids = panelIds;
             row.map_rotation = rotation;
+            if (orientations) {
+                row.panel_orientations = orientations;
+            }
             if (row.mapping) {
                 row.mapping.panel_ids = panelIds;
                 row.mapping.map_rotation = rotation;
+                if (orientations) {
+                    row.mapping.panel_orientations = orientations;
+                }
             }
+        }
+
+        function panelOrientationsFrom(light, mapping) {
+            const pending = light && light.id != null ? panelOrientPending[light.id] : null;
+            const raw = pending
+                || (light && light.panel_orientations)
+                || (mapping && mapping.panel_orientations)
+                || {};
+            const out = {};
+            Object.entries(raw).forEach(([id, degrees]) => {
+                const snapped = normalizeMapRotation(degrees);
+                if (snapped) out[Number(id)] = snapped;
+            });
+            return out;
+        }
+
+        function nextAddressSlot(assigned, total) {
+            const used = new Set(Object.values(assigned).map(Number));
+            for (let slot = 1; slot <= total; slot += 1) {
+                if (!used.has(slot)) return slot;
+            }
+            return total + 1;
+        }
+
+        function panelMapModeFrom(lightId) {
+            return panelMapMode[lightId] === 'edit' ? 'edit' : 'play';
+        }
+
+        function setPanelMapMode(lightId, mode) {
+            const next = mode === 'edit' ? 'edit' : 'play';
+            if (next === 'play' && panelAddressDraft && panelAddressDraft.lightId === lightId) {
+                showNotification('Save or cancel re-address before leaving Edit');
+                return;
+            }
+            if (next === 'play' && panelMapIsDirty(lightId)) {
+                showNotification('Save map before leaving Edit');
+                return;
+            }
+            panelMapMode[lightId] = next;
+            renderLights(lastLightsData);
+        }
+
+        function panelMapZoomFrom(lightId) {
+            const zoom = Number(panelMapZoom[lightId]);
+            if (!Number.isFinite(zoom)) return 1;
+            return Math.min(PANEL_MAP_ZOOM_MAX, Math.max(PANEL_MAP_ZOOM_MIN, zoom));
+        }
+
+        function setPanelMapZoom(lightId, zoom) {
+            const next = Math.round(Math.min(PANEL_MAP_ZOOM_MAX, Math.max(PANEL_MAP_ZOOM_MIN, Number(zoom))) * 2) / 2;
+            panelMapZoom[lightId] = next;
+            renderLights(lastLightsData);
+        }
+
+        function onPanelMapWheel(event, lightId) {
+            if (!event.ctrlKey && !event.metaKey) return;
+            event.preventDefault();
+            const dir = event.deltaY < 0 ? PANEL_MAP_ZOOM_STEP : -PANEL_MAP_ZOOM_STEP;
+            setPanelMapZoom(lightId, panelMapZoomFrom(lightId) + dir);
         }
 
         async function savePanelAddressing(lightId, body) {
@@ -1243,39 +1415,70 @@
             }
             const pending = panelRotationPending[lightId];
             const rotation = pending != null ? pending : data.map_rotation;
-            applyAddressingLocally(lightId, data.panel_ids, rotation);
+            const orientations = panelOrientPending[lightId] || data.panel_orientations;
+            applyAddressingLocally(lightId, data.panel_ids, rotation, orientations);
             return data;
+        }
+
+        function markPanelMapDirty(lightId) {
+            panelMapDirty[lightId] = true;
+        }
+
+        function panelMapIsDirty(lightId) {
+            return Boolean(panelMapDirty[lightId]);
+        }
+
+        function draftOrderFrom(draft) {
+            return Object.entries(draft.assigned)
+                .sort((left, right) => left[1] - right[1])
+                .map(([id]) => Number(id));
+        }
+
+        function draftIsComplete(draft) {
+            return Boolean(draft && Object.keys(draft.assigned).length === draft.total);
+        }
+
+        async function savePanelMap(lightId) {
+            const row = findLightRow(lightId);
+            if (!row) return;
+            const mapping = row.mapping || {};
+            const draft = panelAddressDraft && panelAddressDraft.lightId === lightId ? panelAddressDraft : null;
+            if (draft && !draftIsComplete(draft)) {
+                showNotification(`Address all ${draft.total} panels before saving`, true);
+                return;
+            }
+            const body = {
+                map_rotation: mapRotationFrom(row, mapping),
+                panel_orientations: panelOrientationsFrom(row, mapping)
+            };
+            if (draft) {
+                body.panel_ids = draftOrderFrom(draft);
+                draft.busy = true;
+            }
+            try {
+                await savePanelAddressing(lightId, body);
+                panelAddressDraft = null;
+                panelMapDirty[lightId] = false;
+                delete panelRotationPending[lightId];
+                delete panelOrientPending[lightId];
+                showNotification('Map saved');
+                renderLights(lastLightsData);
+            } catch (error) {
+                if (panelAddressDraft) panelAddressDraft.busy = false;
+                showNotification(error.message, true);
+                renderLights(lastLightsData);
+            }
         }
 
         async function setPanelMapRotation(lightId, degrees) {
             const next = normalizeMapRotation(degrees);
             panelRotationPending[lightId] = next;
+            markPanelMapDirty(lightId);
             const row = findLightRow(lightId);
             if (row) {
                 applyAddressingLocally(lightId, panelIdsFrom(row, row.mapping || {}), next);
-                renderLights(lastLightsData);
             }
-            const previous = panelRotationSaves[lightId] || Promise.resolve();
-            const run = previous.catch(() => {}).then(async () => {
-                if (normalizeMapRotation(panelRotationPending[lightId]) !== next) {
-                    return;
-                }
-                await savePanelAddressing(lightId, { map_rotation: next });
-                if (normalizeMapRotation(panelRotationPending[lightId]) === next) {
-                    delete panelRotationPending[lightId];
-                }
-            });
-            panelRotationSaves[lightId] = run;
-            try {
-                await run;
-                renderLights(lastLightsData);
-            } catch (error) {
-                if (normalizeMapRotation(panelRotationPending[lightId]) === next) {
-                    delete panelRotationPending[lightId];
-                }
-                renderLights(lastLightsData);
-                showNotification(error.message, true);
-            }
+            renderLights(lastLightsData);
         }
 
         async function nudgePanelMap(lightId, delta) {
@@ -1289,9 +1492,24 @@
         }
 
         function startPanelReaddress(lightId) {
+            panelMapMode[lightId] = 'edit';
             const row = findLightRow(lightId);
             if (!row) return;
-            panelAddressDraft = { lightId, assigned: {}, next: 1, total: panelLayoutFrom(row, row.mapping || {}).length };
+            const mapping = row.mapping || {};
+            const layoutIds = new Set(panelLayoutFrom(row, mapping).map(panel => Number(panel.id)));
+            const order = panelIdsFrom(row, mapping).filter(id => layoutIds.has(Number(id)));
+            const assigned = {};
+            order.forEach((id, index) => {
+                assigned[Number(id)] = index + 1;
+            });
+            const total = panelLayoutFrom(row, mapping).length;
+            panelAddressDraft = {
+                lightId,
+                assigned,
+                next: nextAddressSlot(assigned, total),
+                total,
+                dirty: false
+            };
             renderLights(lastLightsData);
         }
 
@@ -1309,35 +1527,92 @@
                     reset_order: true
                 });
                 panelAddressDraft = null;
+                panelMapDirty[lightId] = false;
                 renderLights(lastLightsData);
             } catch (error) {
                 showNotification(error.message, true);
             }
         }
 
-        async function onPanelMapClick(lightId, panelId) {
-            if (!panelAddressDraft || panelAddressDraft.lightId !== lightId) return;
-            if (panelAddressDraft.busy) return;
-            const numericId = Number(panelId);
-            if (panelAddressDraft.assigned[numericId]) return;
-            panelAddressDraft.assigned[numericId] = panelAddressDraft.next;
-            panelAddressDraft.next += 1;
-            if (panelAddressDraft.next > panelAddressDraft.total) {
-                const order = Object.entries(panelAddressDraft.assigned)
-                    .sort((left, right) => left[1] - right[1])
-                    .map(([id]) => Number(id));
-                panelAddressDraft.busy = true;
-                try {
-                    await savePanelAddressing(lightId, { panel_ids: order });
-                    panelAddressDraft = null;
-                    showNotification('Pixel order saved');
-                } catch (error) {
-                    showNotification(error.message, true);
-                    if (panelAddressDraft) panelAddressDraft.busy = false;
-                    return;
+        async function identifyPanel(lightId, panelId) {
+            try {
+                const response = await fetch('/api/lights/identify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ light_id: lightId, panel_id: Number(panelId) })
+                });
+                const data = await validateJsonResponse(response);
+                if (!data.success) {
+                    showNotification(data.error || 'Identify failed', true);
                 }
+            } catch (error) {
+                showNotification(error.message, true);
             }
+        }
+
+        async function setPanelOrientation(lightId, panelId, degrees) {
+            const row = findLightRow(lightId);
+            if (!row) return;
+            const next = { ...panelOrientationsFrom(row, row.mapping || {}) };
+            const snapped = normalizeMapRotation(degrees);
+            if (snapped) {
+                next[Number(panelId)] = snapped;
+            } else {
+                delete next[Number(panelId)];
+            }
+            panelOrientPending[lightId] = next;
+            panelMapSelected[lightId] = Number(panelId);
+            markPanelMapDirty(lightId);
+            applyAddressingLocally(
+                lightId,
+                panelIdsFrom(row, row.mapping || {}),
+                mapRotationFrom(row, row.mapping || {}),
+                next
+            );
             renderLights(lastLightsData);
+        }
+
+        async function nudgeSelectedPanel(lightId, delta) {
+            const selected = panelMapSelected[lightId];
+            if (selected == null) {
+                showNotification('Click a panel first to rotate it');
+                return;
+            }
+            const row = findLightRow(lightId);
+            if (!row) return;
+            const current = panelOrientationsFrom(row, row.mapping || {})[Number(selected)] || 0;
+            await setPanelOrientation(lightId, selected, current + Number(delta));
+        }
+
+        async function onPanelMapClick(lightId, panelId) {
+            if (panelMapModeFrom(lightId) !== 'edit') return;
+            const numericId = Number(panelId);
+            panelMapSelected[lightId] = numericId;
+            if (!panelAddressDraft || panelAddressDraft.lightId !== lightId) {
+                renderLights(lastLightsData);
+                return;
+            }
+            if (panelAddressDraft.busy) return;
+            if (panelAddressDraft.assigned[numericId]) {
+                delete panelAddressDraft.assigned[numericId];
+                panelAddressDraft.dirty = true;
+                panelAddressDraft.next = nextAddressSlot(panelAddressDraft.assigned, panelAddressDraft.total);
+                renderLights(lastLightsData);
+                return;
+            }
+            panelAddressDraft.assigned[numericId] = panelAddressDraft.next;
+            panelAddressDraft.dirty = true;
+            panelAddressDraft.next = nextAddressSlot(panelAddressDraft.assigned, panelAddressDraft.total);
+            renderLights(lastLightsData);
+        }
+
+        function identifySelectedPanel(lightId) {
+            const selected = panelMapSelected[lightId];
+            if (selected == null) {
+                showNotification('Click a panel first to identify it');
+                return;
+            }
+            identifyPanel(lightId, selected);
         }
 
         function onPanelMapKey(event, lightId, panelId) {
@@ -1350,6 +1625,9 @@
             const panels = panelLayoutFrom(light, mapping);
             if (panels.length < 2) return '';
             const rotation = mapRotationFrom(light, mapping);
+            const orientations = panelOrientationsFrom(light, mapping);
+            const selectedId = panelMapSelected[light.id];
+            const zoom = panelMapZoomFrom(light.id);
             const originX = panels.reduce((sum, panel) => sum + (Number(panel.x) || 0), 0) / panels.length;
             const originY = panels.reduce((sum, panel) => sum + (Number(panel.y) || 0), 0) / panels.length;
             const placed = panels.map(panel => {
@@ -1358,12 +1636,15 @@
                     (Number(panel.y) || 0) - originY,
                     rotation
                 );
-                return { ...panel, x: rx, y: ry, o: (Number(panel.o) || 0) + rotation };
+                const extra = orientations[Number(panel.id)] || 0;
+                return { ...panel, x: rx, y: ry, o: (Number(panel.o) || 0) + extra + rotation };
             });
-            const side = Number(light.side_length || mapping.side_length || 100) || 100;
+            const reportedSide = Number(light.side_length || mapping.side_length || 0) || 0;
+            const model = light.model || mapping.model || '';
+            const panelSides = placed.map(panel => panelSideLength(panel.shapeType, reportedSide, model));
+            const pad = Math.max(100, ...panelSides);
             const xs = placed.map(panel => panel.x);
             const ys = placed.map(panel => panel.y);
-            const pad = side;
             const minX = Math.min(...xs) - pad;
             const maxX = Math.max(...xs) + pad;
             const minY = Math.min(...ys) - pad;
@@ -1375,22 +1656,22 @@
             const cells = controlCellsForMode(selectedMode, light);
             const pixel = isPixelMode(selectedMode);
             const draft = panelAddressDraft && panelAddressDraft.lightId === light.id ? panelAddressDraft : null;
+            const mode = draft ? 'edit' : panelMapModeFrom(light.id);
+            const editing = mode === 'edit';
             const order = panelIdsFrom(light, mapping);
             const indexById = new Map(order.map((id, index) => [Number(id), index]));
             const shapes = placed.map(panel => {
                 const cx = panel.x - minX;
                 const cy = maxY - panel.y;
-                const points = panelPolygonPoints(
-                    panelShapeKind(panel.shapeType),
-                    cx,
-                    cy,
-                    side,
-                    panel.o
-                );
+                const kind = panelShapeKind(panel.shapeType, model);
+                const panelSide = panelSideLength(panel.shapeType, reportedSide, model);
+                const points = panelPolygonPoints(kind, cx, cy, panelSide, panel.o);
                 const assigned = draft ? draft.assigned[Number(panel.id)] : (indexById.has(Number(panel.id)) ? indexById.get(Number(panel.id)) + 1 : '');
                 const classes = [];
-                if (draft && assigned) classes.push('is-assigned');
+                if (assigned) classes.push('is-assigned');
                 if (draft && !assigned) classes.push('is-next');
+                if (Number(panel.id) === Number(selectedId)) classes.push('is-selected');
+                const labelSpread = kind === 'line' ? Math.max(panelSide * 0.12, 10) : panelSide * 0.18;
                 let channelText = '';
                 if (!draft && pixel && cells > 1 && assigned) {
                     const matrixWidth = Number(light.matrix_width || mapping.matrix_width || 0);
@@ -1402,28 +1683,63 @@
                         cell = Math.floor(pixelIndex * cells / panels.length);
                     }
                     cell = Math.min(cells - 1, cell);
-                    channelText = `<text class="panel-ch" x="${cx.toFixed(1)}" y="${(cy + side * 0.18).toFixed(1)}">${startCh + cell * per}</text>`;
+                    channelText = `<text class="panel-ch" x="${cx.toFixed(1)}" y="${(cy + labelSpread).toFixed(1)}">${startCh + cell * per}</text>`;
                 }
                 const ariaLabel = assigned ? `Panel ${assigned}` : 'Unassigned panel';
-                return `<g tabindex="0" role="button" aria-label="${esc(ariaLabel)}" onclick="onPanelMapClick('${escJs(light.id)}', ${Number(panel.id)})" onkeydown="onPanelMapKey(event, '${escJs(light.id)}', ${Number(panel.id)})">
+                const interact = editing
+                    ? ` tabindex="0" role="button" aria-label="${esc(ariaLabel)}" onclick="onPanelMapClick('${escJs(light.id)}', ${Number(panel.id)})" onkeydown="onPanelMapKey(event, '${escJs(light.id)}', ${Number(panel.id)})"`
+                    : '';
+                return `<g class="${kind === 'line' ? 'is-line' : ''}"${interact}>
                     <polygon class="${classes.join(' ')}" points="${points}"></polygon>
-                    <text class="panel-idx" x="${cx.toFixed(1)}" y="${(channelText ? cy - side * 0.08 : cy).toFixed(1)}">${assigned || ''}</text>
+                    <text class="panel-idx" x="${cx.toFixed(1)}" y="${(channelText ? cy - labelSpread * 0.45 : cy).toFixed(1)}">${assigned || ''}</text>
                     ${channelText}
                 </g>`;
             }).join('');
+            const dirty = panelMapIsDirty(light.id);
+            const canSave = draft ? draftIsComplete(draft) : dirty;
             let hint;
-            if (draft) {
-                hint = `Click panels in pixel order. Next: ${draft.next} of ${draft.total}.`;
+            if (!editing) {
+                hint = 'Play mode is preview only. Switch to Edit to rotate or re-address. Use Identify on the row to flash the whole fixture.';
+            } else if (draft && draftIsComplete(draft)) {
+                hint = 'All panels addressed. Click Save map to keep this pixel order, or click a green panel to clear it.';
+            } else if (draft) {
+                hint = `Click a panel to assign the next number. Click a green panel to clear it. Next: ${draft.next} of ${draft.total}. Then click Save map.`;
+            } else if (dirty) {
+                hint = 'Click Save map when the rotation and pixel order look right.';
             } else if (pixel && cells === panels.length) {
-                hint = 'Numbers are pixel order. Cyan is that panel’s start DMX channel.';
+                hint = 'Edit mode. Click a panel to select it, then rotate or Identify panel. Cyan is that panel’s start DMX channel.';
             } else {
-                hint = 'Numbers are pixel order. Rotate the map to match the wall, then re-address or reset order.';
+                hint = 'Edit mode. Click a panel to select it, then rotate it or Identify panel. Save map when it looks right.';
             }
-            const actions = draft
+            const selectedAngle = selectedId != null ? (orientations[Number(selectedId)] || 0) : null;
+            const modeSwitch = `<div class="panel-map-mode" role="group" aria-label="Map mode">
+                    <button class="btn btn-small${editing ? '' : ' is-on'}" type="button" onclick="setPanelMapMode('${escJs(light.id)}', 'play')">Play</button>
+                    <button class="btn btn-small${editing ? ' is-on' : ''}" type="button" onclick="setPanelMapMode('${escJs(light.id)}', 'edit')">Edit</button>
+                   </div>`;
+            const zoomActions = `<button class="btn btn-small" type="button" onclick="setPanelMapZoom('${escJs(light.id)}', ${zoom - PANEL_MAP_ZOOM_STEP})">−</button>
+                    <span class="panel-map-angle">${Math.round(zoom * 100)}%</span>
+                    <button class="btn btn-small" type="button" onclick="setPanelMapZoom('${escJs(light.id)}', ${zoom + PANEL_MAP_ZOOM_STEP})">+</button>`;
+            const panelRotate = panelAddressDraft && panelAddressDraft.lightId === light.id
+                ? ''
+                : `<button class="btn btn-small" type="button" onclick="nudgeSelectedPanel('${escJs(light.id)}', -15)">Panel −15°</button>
+                    <span class="panel-map-angle">${selectedAngle == null ? '—' : `${selectedAngle}°`}</span>
+                    <button class="btn btn-small" type="button" onclick="nudgeSelectedPanel('${escJs(light.id)}', 15)">Panel +15°</button>
+                    <button class="btn btn-small" type="button" onclick="identifySelectedPanel('${escJs(light.id)}')">Identify panel</button>`;
+            const saveRow = `<div class="panel-map-actions panel-map-save-row">
+                    <button class="btn btn-primary btn-small" type="button" ${canSave ? '' : 'disabled '}onclick="savePanelMap('${escJs(light.id)}')">Save map</button>
+                    ${draft ? `<button class="btn btn-small" type="button" onclick="cancelPanelReaddress()">Cancel</button>` : `<button class="btn btn-small" type="button" onclick="setPanelMapMode('${escJs(light.id)}', 'play')">Done</button>`}
+                    ${!dirty && !draft ? '<span class="panel-map-saved">Saved</span>' : ''}
+                   </div>`;
+            const actions = !editing
+                ? `<div class="panel-map-actions">${zoomActions}</div>`
+                : draft
                 ? `<div class="panel-map-actions">
-                    <button class="btn btn-small" type="button" onclick="cancelPanelReaddress()">Cancel</button>
-                   </div>`
+                    ${zoomActions}
+                    ${panelRotate}
+                   </div>
+                   ${saveRow}`
                 : `<div class="panel-map-actions">
+                    ${zoomActions}
                     <button class="btn btn-small" type="button" onclick="nudgePanelMap('${escJs(light.id)}', -30)">−30°</button>
                     <button class="btn btn-small" type="button" onclick="nudgePanelMap('${escJs(light.id)}', -15)">−15°</button>
                     <span class="panel-map-angle">${rotation}°</span>
@@ -1432,11 +1748,16 @@
                     <select aria-label="Map rotation" onchange="setPanelMapRotation('${escJs(light.id)}', this.value)">
                         ${rotationOptions(rotation)}
                     </select>
+                    ${panelRotate}
                     <button class="btn btn-small" type="button" onclick="startPanelReaddress('${escJs(light.id)}')">Re-address</button>
                     <button class="btn btn-small" type="button" onclick="resetPanelOrder('${escJs(light.id)}')">Reset order</button>
-                   </div>`;
-            return `<div class="panel-map${draft ? ' is-addressing' : ''}">
-                <svg viewBox="0 0 ${width.toFixed(1)} ${height.toFixed(1)}" role="img" aria-label="Panel address layout">${shapes}</svg>
+                   </div>
+                   ${saveRow}`;
+            return `<div class="panel-map${editing ? ' is-edit' : ' is-play'}${draft ? ' is-addressing' : ''}" style="--map-zoom: ${zoom}">
+                ${modeSwitch}
+                <div class="panel-map-viewport" onwheel="onPanelMapWheel(event, '${escJs(light.id)}')">
+                    <svg viewBox="0 0 ${width.toFixed(1)} ${height.toFixed(1)}" role="img" aria-label="Panel address layout">${shapes}</svg>
+                </div>
                 ${actions}
                 <p class="field-hint">${hint}</p>
             </div>`;
@@ -1959,7 +2280,7 @@
         }
 
         function scheduleTestRgb(lightId) {
-            stopPixelChase(lightId);
+            stopPixelEffects(lightId);
             if (testRgbTimers[lightId]) clearTimeout(testRgbTimers[lightId]);
             testRgbTimers[lightId] = setTimeout(() => {
                 delete testRgbTimers[lightId];
@@ -2003,10 +2324,14 @@
                             <div class="test-actions">
                                 ${pixelPatterns.map(pattern => {
                                     const pid = escJs(pattern.id);
-                                    const chase = pattern.id === 'chase';
-                                    const btnId = chase ? `pixel-chase-btn-${esc(light.id)}` : `pixel-pattern-${esc(light.id)}-${esc(pattern.id)}`;
-                                    const handler = chase
-                                        ? `togglePixelChase('${id}')`
+                                    const effect = pattern.id === 'chase' || pattern.id === 'rainbow';
+                                    const btnId = pattern.id === 'chase'
+                                        ? `pixel-chase-btn-${esc(light.id)}`
+                                        : pattern.id === 'rainbow'
+                                            ? `pixel-rainbow-btn-${esc(light.id)}`
+                                            : `pixel-pattern-${esc(light.id)}-${esc(pattern.id)}`;
+                                    const handler = effect
+                                        ? `togglePixelEffect('${id}', '${pid}')`
                                         : `sendPixelPattern('${id}', '${pid}')`;
                                     return `<button class="btn btn-small" id="${btnId}" type="button" onclick="${handler}">${esc(pattern.label)}</button>`;
                                 }).join('')}
@@ -2060,7 +2385,7 @@
         }
 
         function setTestColor(lightId, r, g, b) {
-            stopPixelChase(lightId);
+            stopPixelEffects(lightId);
             if (!setRgbInputs(lightId, r, g, b)) {
                 showNotification('Error: Light controls not found', true);
                 return;
@@ -2090,6 +2415,9 @@
             if (extra && extra.index != null) {
                 body.index = extra.index;
             }
+            if (extra && extra.offset != null) {
+                body.offset = extra.offset;
+            }
             if (extra && extra.fade_ms != null) {
                 body.fade_ms = extra.fade_ms;
             }
@@ -2099,7 +2427,7 @@
         async function sendPixelPattern(lightId, pattern) {
             stopAnimation(lightId, 'chase');
             stopAnimation(lightId, 'sinewave');
-            stopPixelChase(lightId);
+            stopPixelEffects(lightId);
             const chaseBtn = document.getElementById(`chase-btn-${lightId}`);
             if (chaseBtn) {
                 chaseBtn.textContent = 'Chase';
@@ -2126,21 +2454,48 @@
             }
         }
 
-        function stopPixelChase(lightId) {
-            stopAnimation(lightId, 'pixel-chase');
-            persistAnimation(lightId, null);
-            const btn = document.getElementById(`pixel-chase-btn-${lightId}`);
-            if (btn) {
-                btn.textContent = 'Pixel chase';
-                btn.classList.remove('is-active');
+        function pixelEffectType(pattern) {
+            if (pattern === 'chase') return 'pixel-chase';
+            if (pattern === 'rainbow') return 'pixel-rainbow';
+            return null;
+        }
+
+        function pixelEffectButtonId(lightId, pattern) {
+            if (pattern === 'chase') return `pixel-chase-btn-${lightId}`;
+            if (pattern === 'rainbow') return `pixel-rainbow-btn-${lightId}`;
+            return null;
+        }
+
+        function resetPixelEffectButtons(lightId) {
+            const chaseBtn = document.getElementById(`pixel-chase-btn-${lightId}`);
+            if (chaseBtn) {
+                chaseBtn.textContent = 'Pixel chase';
+                chaseBtn.classList.remove('is-active');
+            }
+            const rainbowBtn = document.getElementById(`pixel-rainbow-btn-${lightId}`);
+            if (rainbowBtn) {
+                rainbowBtn.textContent = 'Rainbow';
+                rainbowBtn.classList.remove('is-active');
             }
         }
 
-        function togglePixelChase(lightId) {
-            const key = `${lightId}-pixel-chase`;
-            const btn = document.getElementById(`pixel-chase-btn-${lightId}`);
+        function stopPixelEffects(lightId) {
+            stopAnimation(lightId, 'pixel-chase');
+            stopAnimation(lightId, 'pixel-rainbow');
+            persistAnimation(lightId, null);
+            resetPixelEffectButtons(lightId);
+        }
+
+        function togglePixelEffect(lightId, pattern) {
+            const type = pixelEffectType(pattern);
+            if (!type) return;
+            const key = `${lightId}-${type}`;
+            const btn = document.getElementById(pixelEffectButtonId(lightId, pattern));
             stopAnimation(lightId, 'chase');
             stopAnimation(lightId, 'sinewave');
+            if (pattern !== 'chase') stopAnimation(lightId, 'pixel-chase');
+            if (pattern !== 'rainbow') stopAnimation(lightId, 'pixel-rainbow');
+            resetPixelEffectButtons(lightId);
             const chaseBtn = document.getElementById(`chase-btn-${lightId}`);
             if (chaseBtn) {
                 chaseBtn.textContent = 'Chase';
@@ -2153,22 +2508,41 @@
             }
 
             if (animationIntervals[key]) {
-                stopPixelChase(lightId);
+                stopPixelEffects(lightId);
                 return;
             }
 
-            let index = 0;
-            persistAnimation(lightId, 'pixel-chase');
-            const tick = () => {
-                fetch('/api/lights/test-pixels', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(testPixelRequestBody(lightId, 'chase', { index: index, fade_ms: 0 }))
-                }).catch(err => console.error('pixel chase failed:', err));
-                index += 1;
-            };
-            tick();
-            animationIntervals[key] = setInterval(tick, getAnimationUpdateInterval());
+            persistAnimation(lightId, type);
+            if (pattern === 'rainbow') {
+                let offset = 0;
+                const tickMs = 80;
+                const tick = () => {
+                    const cycleMs = Math.max(4000, getAnimationUpdateInterval() * 24);
+                    fetch('/api/lights/test-pixels', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(testPixelRequestBody(lightId, pattern, {
+                            offset: offset,
+                            fade_ms: tickMs
+                        }))
+                    }).catch(err => console.error(type + ' failed:', err));
+                    offset = (offset + tickMs / cycleMs) % 1;
+                };
+                tick();
+                animationIntervals[key] = setInterval(tick, tickMs);
+            } else {
+                let index = 0;
+                const tick = () => {
+                    fetch('/api/lights/test-pixels', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(testPixelRequestBody(lightId, pattern, { index: index, fade_ms: 0 }))
+                    }).catch(err => console.error(type + ' failed:', err));
+                    index += 1;
+                };
+                tick();
+                animationIntervals[key] = setInterval(tick, getAnimationUpdateInterval());
+            }
             if (btn) {
                 btn.textContent = 'Stop';
                 btn.classList.add('is-active');
@@ -2194,7 +2568,7 @@
 
         function persistAnimation(lightId, type) {
             const state = readPersistedAnimations();
-            if (type === 'chase' || type === 'sinewave' || type === 'pixel-chase') {
+            if (type === 'chase' || type === 'sinewave' || type === 'pixel-chase' || type === 'pixel-rainbow') {
                 state[lightId] = type;
             } else {
                 delete state[lightId];
@@ -2231,7 +2605,9 @@
             }
             const state = readPersistedAnimations();
             Object.keys(state).forEach(lightId => {
-                if (!document.getElementById(`chase-btn-${lightId}`) && !document.getElementById(`pixel-chase-btn-${lightId}`)) {
+                if (!document.getElementById(`chase-btn-${lightId}`)
+                    && !document.getElementById(`pixel-chase-btn-${lightId}`)
+                    && !document.getElementById(`pixel-rainbow-btn-${lightId}`)) {
                     persistAnimation(lightId, null);
                     return;
                 }
@@ -2239,8 +2615,10 @@
                 if (type === 'chase') toggleRgbChase(lightId);
                 else if (type === 'sinewave') toggleSinewave(lightId);
                 else if (type === 'pixel-chase' && document.getElementById(`pixel-chase-btn-${lightId}`)) {
-                    togglePixelChase(lightId);
-                } else if (type === 'pixel-chase') {
+                    togglePixelEffect(lightId, 'chase');
+                } else if (type === 'pixel-rainbow' && document.getElementById(`pixel-rainbow-btn-${lightId}`)) {
+                    togglePixelEffect(lightId, 'rainbow');
+                } else if (type === 'pixel-chase' || type === 'pixel-rainbow') {
                     persistAnimation(lightId, null);
                 }
             });
@@ -2397,6 +2775,10 @@
                 btn.textContent = 'Pixel chase';
                 btn.classList.remove('is-active');
             });
+            document.querySelectorAll('[id^="pixel-rainbow-btn-"]').forEach(btn => {
+                btn.textContent = 'Rainbow';
+                btn.classList.remove('is-active');
+            });
         }
 
         function stopAllAnimations(silent = false) {
@@ -2425,7 +2807,7 @@
             const btn = document.getElementById(`chase-btn-${lightId}`);
 
             stopAnimation(lightId, 'sinewave');
-            stopPixelChase(lightId);
+            stopPixelEffects(lightId);
             const sinewaveBtn = document.getElementById(`sinewave-btn-${lightId}`);
             if (sinewaveBtn) {
                 sinewaveBtn.textContent = 'Sinewave';
@@ -2477,7 +2859,7 @@
             const btn = document.getElementById(`sinewave-btn-${lightId}`);
 
             stopAnimation(lightId, 'chase');
-            stopPixelChase(lightId);
+            stopPixelEffects(lightId);
             const chaseBtn = document.getElementById(`chase-btn-${lightId}`);
             if (chaseBtn) {
                 chaseBtn.textContent = 'Chase';
