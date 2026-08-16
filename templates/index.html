@@ -413,6 +413,25 @@
             stroke: var(--cyan);
         }
 
+        .panel-map g[role="button"]:focus {
+            outline: none;
+        }
+
+        .panel-map g[role="button"]:focus-visible polygon {
+            stroke: var(--text);
+            stroke-width: 6;
+        }
+
+        .panel-map g[role="button"]:focus-visible polygon.is-assigned {
+            stroke: var(--live);
+            stroke-width: 6;
+        }
+
+        .panel-map g[role="button"]:focus-visible polygon.is-next {
+            stroke: var(--cyan);
+            stroke-width: 6;
+        }
+
         .panel-map text {
             fill: var(--text);
             font-family: var(--mono);
@@ -1254,6 +1273,7 @@
                 if (normalizeMapRotation(panelRotationPending[lightId]) === next) {
                     delete panelRotationPending[lightId];
                 }
+                renderLights(lastLightsData);
                 showNotification(error.message, true);
             }
         }
@@ -1373,7 +1393,15 @@
                 if (draft && !assigned) classes.push('is-next');
                 let channelText = '';
                 if (!draft && pixel && cells > 1 && assigned) {
-                    const cell = Math.min(cells - 1, Math.floor((assigned - 1) * cells / panels.length));
+                    const matrixWidth = Number(light.matrix_width || mapping.matrix_width || 0);
+                    const pixelIndex = assigned - 1;
+                    let cell;
+                    if (matrixWidth > 1 && cells === matrixWidth) {
+                        cell = pixelIndex % matrixWidth;
+                    } else {
+                        cell = Math.floor(pixelIndex * cells / panels.length);
+                    }
+                    cell = Math.min(cells - 1, cell);
                     channelText = `<text class="panel-ch" x="${cx.toFixed(1)}" y="${(cy + side * 0.18).toFixed(1)}">${startCh + cell * per}</text>`;
                 }
                 const ariaLabel = assigned ? `Panel ${assigned}` : 'Unassigned panel';

@@ -37,38 +37,38 @@ Control LIFX and Nanoleaf lights via sACN/E1.31 with automatic discovery and a w
 - **Configuration Reload**: Reload configuration from disk without restarting the application
 - **Thread-Safe**: Robust multi-threaded architecture for reliable DMX processing
 
-## Installation
+## Run on Mac or Windows
 
-This project needs **Python 3.10 or newer**. zeroconf 0.149.0 sets that floor; Flask 3.1 supports Python 3.9 and newer. 3.12 is a good choice.
+You need **Python 3.10 or newer** installed once. After that, start the app by double-clicking:
 
-Check what you already have:
+| OS | Double-click |
+| --- | --- |
+| **Mac** | `start.command` — if macOS blocks it, right-click the file and choose **Open** |
+| **Windows** | `start.bat` |
+
+What happens:
+
+1. The first run creates a local `.venv` and installs packages. That can take a minute. Later runs reuse it.
+2. Your browser should open to `http://localhost:5001`. If it does not, open that address yourself.
+3. Leave the terminal window open while you use the app. Close it or press Ctrl+C to quit.
+
+The first time, macOS or Windows may ask for network permission. Allow it so LIFX, Nanoleaf, and sACN can work.
+
+### Install Python (once)
+
+Check first:
 
 ```bash
-python3 --version
+python3 --version          # Windows: python --version
 ```
 
-If that prints `Python 3.10.x` or higher, skip ahead to [Install Python packages](#install-python-packages). If the command is missing or the version is older, install Python first.
+If that prints `Python 3.10.x` or higher, skip this step.
 
-### Install Python
+**macOS** — [python.org downloads](https://www.python.org/downloads/) or Homebrew: `brew install python`. Open a new terminal and confirm with `python3 --version`.
 
-**macOS**
+**Windows** — [python.org downloads](https://www.python.org/downloads/windows/). During setup, tick **Add python.exe to PATH**. Confirm in Command Prompt or PowerShell with `python --version`.
 
-- [python.org downloads](https://www.python.org/downloads/) — the official installer, or
-- Homebrew: `brew install python`
-
-After installing, open a new terminal and confirm with `python3 --version`.
-
-**Windows**
-
-- [python.org downloads](https://www.python.org/downloads/windows/)
-- During setup, tick **Add python.exe to PATH**
-- Confirm in Command Prompt or PowerShell: `python --version`
-
-On Windows, use `python` instead of `python3` in the commands below if that is what the installer registered.
-
-**Linux**
-
-Use your package manager, for example:
+**Linux** — use your package manager, for example:
 
 ```bash
 # Debian / Ubuntu
@@ -78,43 +78,40 @@ sudo apt update && sudo apt install python3 python3-venv python3-pip
 sudo dnf install python3 python3-pip
 ```
 
-### Install Python packages
+Then run `python3 launch.py` from the project folder.
 
-From the project directory:
+This project needs Python 3.10+ because zeroconf 0.149.0 sets that floor. Flask 3.1 supports Python 3.9 and newer. 3.12 is a good choice.
+
+### Manual setup (optional)
+
+`start.command`, `start.bat`, and `python3 launch.py` already create `.venv` and install packages. Use this only if you want to do it yourself:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python3 -m pip install -r requirements.txt
+python3 app.py
 ```
 
-A virtual environment (`.venv`) keeps these packages out of your system Python. Activate it again in any new terminal before running the app.
+To skip the automatic browser tab: `SACN2HOMELX_OPEN_BROWSER=0 python3 launch.py`
 
-To leave the venv later: `deactivate`.
+The server binds to `127.0.0.1` by default (`FLASK_HOST` overrides this). The API is unauthenticated; on untrusted networks put it behind a reverse proxy or a production WSGI server.
 
 ## Usage
 
-1. Start the server:
+1. Start the app as described in [Run on Mac or Windows](#run-on-mac-or-windows).
 
-    ```bash
-    python3 app.py
-    ```
-
-    The development server binds to `127.0.0.1` by default (`FLASK_HOST` overrides this). The API is unauthenticated; on untrusted networks put it behind a reverse proxy or a production WSGI server.
-
-2. Open your browser to `http://localhost:5001`
-
-3. **Configure Network Interfaces** (if needed):
+2. **Configure Network Interfaces** (if needed):
    - Select the network interface for LIFX and Nanoleaf discovery
    - Select the network interface for sACN (DMX) reception
    - Click "Save & Apply Settings"
 
-4. **Discover Lights**:
+3. **Discover Lights**:
    - Click "Discover" to find LIFX bulbs and Nanoleaf controllers on your network
    - Lights will appear in the Unmapped section
    - Nanoleaf controllers must be **paired** before they can be patched or tested. See [Pair a Nanoleaf](#pair-a-nanoleaf).
 
-5. **Configure Light Mappings**:
+4. **Configure Light Mappings**:
    For each light, configure:
    - **Name**: Optional display name for this mapping (stored locally; the physical LIFX label is unchanged)
    - **Universe**: The DMX universe number (typically 1-512)
@@ -122,17 +119,17 @@ To leave the venv later: `deactivate`.
    - **Brightness**: Overall brightness multiplier (0-100%)
    - **Channel Mode**: Select from the modes listed under [DMX Channel Mapping](#dmx-channel-mapping). SuperColour and other pixel fixtures also offer Full Pixel and grouped counts.
 
-6. **Test Lights** (Optional):
+5. **Test Lights** (Optional):
    - Use the "Test RGB (DMX-less)" section to test lights directly
    - Enter RGB values (0-255) or use quick color buttons — colour is sent as you change it
    - Adjust brightness the same way; no send button required
 
-7. **Start DMX Processing**:
+6. **Start DMX Processing**:
    - Click "Start DMX" to begin processing sACN data
    - Monitor the status bar for DMX reception status
    - Active universes and packet counts are displayed in real-time
 
-8. **Stop DMX Processing**:
+7. **Stop DMX Processing**:
    - Click "Stop DMX" to halt DMX processing while keeping the server running
 
 ## Nanoleaf
@@ -381,7 +378,7 @@ A fade a bit longer than the send interval keeps the bulb interpolating toward t
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+ (install once; `start.command` / `start.bat` handle the rest)
 - LIFX lights and/or Nanoleaf controllers on the same network
 - DMX/E1.31 source (e.g., lighting console, software)
 - Network interface with multicast support for sACN
@@ -395,7 +392,9 @@ A fade a bit longer than the send interval keeps the bulb interpolating toward t
 
 ## Troubleshooting
 
-- **`python3` not found / version too old**: Install Python 3.10+ as described in [Installation](#installation), then open a new terminal. On Windows try `python` instead of `python3`.
+- **`python3` not found / version too old**: Install Python 3.10+ as described in [Install Python (once)](#install-python-once), then open a new terminal. On Windows try `python` instead of `python3`. After Python is on PATH, double-click `start.command` (Mac) or `start.bat` (Windows).
+- **`start.command` will not open on Mac**: Right-click the file → **Open**. If it still fails, in Terminal run `chmod +x start.command` from the project folder.
+- **Browser did not open**: Go to `http://localhost:5001` yourself. Leave the start window open.
 - **Lights not discovered**: Ensure lights are on the same network and powered on. Try using "Add by IP" with the light's IP address.
 - **Nanoleaf pairing fails**: See [Pair a Nanoleaf](#pair-a-nanoleaf). Hold the controller power button until the LED flashes, then click Pair within 30 seconds. A 403 means the pairing window was not open. Skylight must use **Connect to API** in the Nanoleaf app. Tokens survive until a factory reset.
 - **DMX not receiving**: Check that the sACN interface is correctly configured and that your DMX source is sending to the correct universe.

@@ -404,7 +404,9 @@ class LifxLanClient:
             if light is None:
                 return
             packets = self._zone_packets_for_light(light, hsbk, duration_ms)
-        for packet in packets:
+        for index, packet in enumerate(packets):
+            if index > 0 and index % LEGACY_MZ_PACKET_BUDGET == 0:
+                self._rate_limit()
             self._send_command_raw(packet, ip)
         if hsbk:
             hue, sat, bri, kel = hsbk[0]
@@ -496,15 +498,6 @@ class LifxLanClient:
                 start = index
                 current = colors[index]
         runs.append((start, len(colors) - 1, current))
-        while len(runs) > LEGACY_MZ_PACKET_BUDGET:
-            merged: List[Tuple[int, int, Tuple[int, int, int, int]]] = []
-            for pair_index in range(0, len(runs), 2):
-                start_index, end_index, color = runs[pair_index]
-                if pair_index + 1 < len(runs):
-                    _next_start, next_end, _next_color = runs[pair_index + 1]
-                    end_index = next_end
-                merged.append((start_index, end_index, color))
-            runs = merged
         last = len(runs) - 1
         for run_index, (start_index, end_index, color) in enumerate(runs):
             apply = MULTI_ZONE_APPLY if run_index == last else MULTI_ZONE_NO_APPLY
@@ -707,6 +700,7 @@ class LifxLanClient:
                         self.lights[target] = light
                     else:
                         light = self.lights[target]
+                    light.ip = ip
                     light.last_seen = time.time()
 
                     # Handle different message types

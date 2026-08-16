@@ -179,10 +179,23 @@ class TestNanoleafDevice(unittest.TestCase):
         mdns = NanoleafDevice('nl_DB6E588CD6DB', '192.168.1.115', label='Shapes 1BD0', model='NL42')
         client.remember(mdns)
         probed = NanoleafDevice('nl_192-168-1-115', '192.168.1.115')
+        probed.id_is_placeholder = True
         merged = client.remember(probed)
         self.assertEqual(merged.id, 'nl_DB6E588CD6DB')
         self.assertEqual(len(client.get_devices()), 1)
         client.close()
+
+    def test_remember_merges_placeholder_outside_192_subnet(self):
+        from nanoleaf_client import NanoleafClient
+        client = NanoleafClient()
+        self.addCleanup(client.close)
+        stable = NanoleafDevice('nl_DB6E588CD6DB', '10.0.0.5', label='Shapes 1BD0', model='NL42')
+        client.remember(stable)
+        probed = NanoleafDevice('nl_10-0-0-5', '10.0.0.5')
+        probed.id_is_placeholder = True
+        merged = client.remember(probed)
+        self.assertEqual(merged.id, 'nl_DB6E588CD6DB')
+        self.assertEqual(len(client.get_devices()), 1)
 
 
 class TestSendColorLayout(unittest.TestCase):
@@ -208,7 +221,12 @@ class TestSendColorLayout(unittest.TestCase):
         self.assertNotIn(0, panel_ids)
 
     def test_stream_drops_when_interval_has_not_elapsed(self):
-        from nanoleaf_client import NanoleafClient, NanoleafDevice, MIN_STREAM_INTERVAL
+        from nanoleaf_client import (
+            NanoleafClient,
+            NanoleafDevice,
+            MIN_STREAM_INTERVAL,
+            build_stream_frame,
+        )
         client = NanoleafClient()
         self.addCleanup(client.close)
         device = NanoleafDevice('nl_x', '127.0.0.1', auth_token='tok', model='NL42')
@@ -222,9 +240,13 @@ class TestSendColorLayout(unittest.TestCase):
         client._stream(device, [(1, 255, 0, 0, 1)])
         client._stream(device, [(1, 0, 255, 0, 1)])
         self.assertEqual(len(sent), 1)
+        self.assertEqual(client._pending_stream[device.id], [(1, 0, 255, 0, 1)])
         client._last_stream[device.id] = 0.0
-        client._stream(device, [(1, 0, 0, 255, 1)])
+        blue = [(1, 0, 0, 255, 1)]
+        client._stream(device, blue)
         self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[-1][0], build_stream_frame(device.stream_version, blue))
+        self.assertNotIn(device.id, client._pending_stream)
         self.assertGreater(MIN_STREAM_INTERVAL, 0)
 
 

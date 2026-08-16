@@ -761,6 +761,47 @@ class TestListLightsApi(unittest.TestCase):
         self.assertEqual(app._display_model(device, {'model': 'Nanoleaf'}), 'Shapes')
         self.assertEqual(app._display_model(None, {'model': 'Nanoleaf'}), 'Unknown model')
 
+    def test_import_nanoleaf_tokens_strips_mapping_auth_token(self):
+        app.light_mappings = {
+            'nl_legacy': {
+                'vendor': 'nanoleaf',
+                'auth_token': 'legacy-token',
+                'ip': '10.0.0.8',
+                'port': 16021,
+            }
+        }
+        app.nanoleaf_auth = {
+            'nl_legacy': {
+                'auth_token': 'should-be-replaced',
+                'ip': '10.0.0.9',
+                'port': 16022,
+            }
+        }
+        app._import_nanoleaf_tokens_from_mappings()
+        self.assertNotIn('auth_token', app.light_mappings['nl_legacy'])
+        self.assertEqual(app.nanoleaf_auth['nl_legacy']['auth_token'], 'legacy-token')
+        self.assertEqual(app.nanoleaf_auth['nl_legacy']['ip'], '10.0.0.8')
+        self.assertEqual(app.nanoleaf_auth['nl_legacy']['port'], 16021)
+
+    def test_import_nanoleaf_tokens_keeps_existing_ip_port_fallback(self):
+        app.light_mappings = {
+            'nl_legacy': {
+                'vendor': 'nanoleaf',
+                'auth_token': 'legacy-token',
+            }
+        }
+        app.nanoleaf_auth = {
+            'nl_legacy': {
+                'auth_token': 'old',
+                'ip': '10.0.0.9',
+                'port': 16022,
+            }
+        }
+        app._import_nanoleaf_tokens_from_mappings()
+        self.assertNotIn('auth_token', app.light_mappings['nl_legacy'])
+        self.assertEqual(app.nanoleaf_auth['nl_legacy']['ip'], '10.0.0.9')
+        self.assertEqual(app.nanoleaf_auth['nl_legacy']['port'], 16022)
+
     def test_pair_nanoleaf_saves_token(self):
         from nanoleaf_client import NanoleafDevice
         device = NanoleafDevice('nl_canvas1', '192.168.1.80', label='Living Canvas', model='NL29')
@@ -774,6 +815,16 @@ class TestListLightsApi(unittest.TestCase):
 
         mock_nl.pair.side_effect = _pair
         app.nanoleaf_auth = {}
+        app.light_mappings = {
+            'nl_canvas1': {
+                'universe': 1,
+                'start_channel': 1,
+                'channel_mode': 'RGB (8bit)',
+                'vendor': 'nanoleaf',
+                'auth_token': 'legacy-on-mapping',
+                'ip': '192.168.1.80',
+            }
+        }
         saved = {}
 
         def _save():
@@ -786,6 +837,7 @@ class TestListLightsApi(unittest.TestCase):
         self.assertTrue(data['success'], data)
         self.assertTrue(data['light']['paired'])
         self.assertEqual(saved['nl_canvas1']['auth_token'], 'secret-token')
+        self.assertNotIn('auth_token', app.light_mappings['nl_canvas1'])
 
     def test_pair_nanoleaf_rejects_invalid_port(self):
         mock_nl = Mock()
@@ -860,6 +912,26 @@ class TestListLightsApi(unittest.TestCase):
             })
         self.assertEqual(custom.get_json()['panel_ids'], [2, 1, 4, 3])
         self.assertEqual(app.light_mappings['nl_shapes']['panel_ids'], [2, 1, 4, 3])
+
+    def test_update_panel_addressing_rejects_non_numeric_layout_ids(self):
+        app.nanoleaf_client = Mock()
+        app.nanoleaf_client.get_device.return_value = None
+        app.light_mappings = {
+            'nl_shapes': {
+                'universe': 1,
+                'start_channel': 1,
+                'channel_mode': 'RGB Full Pixel (8bit)',
+                'vendor': 'nanoleaf',
+                'panel_layout': [{'id': 'abc', 'x': 0, 'y': 0}, {'id': 2, 'x': 1, 'y': 0}],
+            }
+        }
+        resp = self.client.post('/api/lights/addressing', json={
+            'light_id': 'nl_shapes',
+            'reset_order': True,
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()['success'])
+        self.assertIn('non-numeric', resp.get_json()['error'])
 
     def test_list_lights_keeps_lifx_online_when_nanoleaf_is_present(self):
         from lifx_client import LifxLight

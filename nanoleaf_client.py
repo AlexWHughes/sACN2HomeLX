@@ -76,6 +76,7 @@ class NanoleafDevice:
         self.layout = 'single'
         self.stream_port = DEFAULT_STREAM_PORT
         self.ext_control_active = False
+        self.id_is_placeholder = False
         self.last_seen = time.time()
 
     @property
@@ -428,6 +429,7 @@ class NanoleafClient:
             except OSError as exc:
                 print(f'Nanoleaf UDP bind failed for {bind_host}: {exc}')
         self._last_stream: Dict[str, float] = {}
+        self._pending_stream: Dict[str, List[Tuple[int, int, int, int, int]]] = {}
 
     def get_devices(self) -> List[NanoleafDevice]:
         with self.lock:
@@ -451,10 +453,12 @@ class NanoleafClient:
             if existing is None:
                 self.devices[device.id] = device
                 return device
-            if existing.id != device.id and device.id.startswith('nl_') and not device.id.startswith('nl_192-'):
+            incoming_placeholder = bool(getattr(device, 'id_is_placeholder', False))
+            if existing.id != device.id and not incoming_placeholder:
                 self.devices.pop(existing.id, None)
                 existing.id = device.id
                 self.devices[existing.id] = existing
+                existing.id_is_placeholder = False
             existing.ip = device.ip or existing.ip
             existing.port = device.port or existing.port
             existing.last_seen = time.time()
@@ -586,6 +590,7 @@ class NanoleafClient:
             return None
         device_id = nanoleaf_light_id(ip.replace('.', '-'))
         device = NanoleafDevice(device_id, ip, port, auth_token=auth_token)
+        device.id_is_placeholder = True
         if auth_token:
             try:
                 self.refresh_info(device)
@@ -595,6 +600,7 @@ class NanoleafClient:
                         with self.lock:
                             self.devices.pop(device.id, None)
                         device.id = stable_id
+                    device.id_is_placeholder = False
             except NanoleafError:
                 device.auth_token = None
         return self.remember(device)
@@ -722,16 +728,24 @@ class NanoleafClient:
         if not device.ext_control_active:
             return
         now = time.time()
+        outgoing = list(panels)
         with self.lock:
             last = self._last_stream.get(device.id, 0.0)
             if now - last < MIN_STREAM_INTERVAL:
+                self._pending_stream[device.id] = outgoing
                 return
+            self._pending_stream.pop(device.id, None)
             self._last_stream[device.id] = now
-        frame = build_stream_frame(device.stream_version, panels)
+        frame = build_stream_frame(device.stream_version, outgoing)
         try:
             self._sock.sendto(frame, (device.ip, device.stream_port))
         except OSError as exc:
             print(f'Nanoleaf UDP send failed for {device.ip}: {exc}')
+            return
+        with self.lock:
+            pending = self._pending_stream.get(device.id)
+            if pending is None or pending == outgoing:
+                self._pending_stream.pop(device.id, None)
 
     def close(self) -> None:
         try:
