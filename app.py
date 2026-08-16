@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-sACN2LIFX - Control LIFX lights via sACN/E1.31
+sACN2HomeLX - Control LIFX and Nanoleaf lights via sACN/E1.31
 """
 
-VERSION = "140826 004"
+VERSION = "160826 012"
 
 import json
 import os
 import hashlib
+import tempfile
 import threading
 import time
 import math
@@ -15,7 +16,8 @@ import colorsys
 import socket
 import logging
 import re
-from typing import Optional, Dict, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
 from collections import deque
 from flask import Flask, render_template, jsonify, request
 from werkzeug.serving import WSGIRequestHandler
@@ -29,6 +31,18 @@ from lifx_client import (
     clamp01,
 )
 from dmx_receiver import DMXReceiver
+from nanoleaf_client import (
+    DEFAULT_API_PORT,
+    NanoleafClient,
+    NanoleafDevice,
+    NanoleafError,
+    apply_panel_order,
+    normalize_map_rotation,
+    order_panel_ids,
+)
+
+Vendor = Literal['lifx', 'nanoleaf']
+MappedDevice = Union[LifxLight, NanoleafDevice]
 
 try:
     import ifaddr
@@ -86,18 +100,23 @@ app = Flask(__name__)
 
 # Global state
 lifx_client: Optional[LifxLanClient] = None
+nanoleaf_client: Optional[NanoleafClient] = None
 dmx_receiver: Optional[DMXReceiver] = None
 light_mappings: Dict[str, Dict] = {}  # light_id -> {universe, start_channel, brightness}
+nanoleaf_auth: Dict[str, Dict] = {}  # light_id -> {auth_token, ip, port}
 running = False
 dmx_thread: Optional[threading.Thread] = None
-lifx_interface: Optional[str] = None  # Network interface IP for LIFX
+lifx_interface: Optional[str] = None  # Network interface IP for LIFX / Nanoleaf discovery
 sacn_interface: Optional[str] = None  # Network interface IP for sACN
 
 # Thread synchronization for DMX state mutations
 dmx_lock = threading.Lock()
+_config_lock = threading.RLock()
 
 # Configuration
 CONFIG_FILE = "config.json"
+CONFIG_FILE_MODE = 0o600
+NANOLEAF_BATCH_WORKERS = 4
 MAX_BRIGHTNESS = 1.0  # Stored as 0-1 internally, displayed as 0-100%
 MAX_LIGHT_LABEL_LEN = 64
 OVERRIDE_MAX_BRIGHT_TOTAL_RGB = 200 * 3
@@ -256,7 +275,7 @@ def _coerce_fade_ms(value) -> Optional[int]:
     return None
 
 
-def _geometry_for(light: Optional[LifxLight], mapping: Optional[Dict] = None) -> Tuple[int, int, int]:
+def _geometry_for(light: Optional[MappedDevice], mapping: Optional[Dict] = None) -> Tuple[int, int, int]:
     """Physical zone count, matrix width, matrix height."""
     mapping = mapping or {}
     count = _int_or(mapping.get('zone_count'), 1)
@@ -294,7 +313,7 @@ def _mapping_is_zone_capable(mapping: Optional[Dict]) -> bool:
     return bool(_light_zone_fields(None, mapping).get('zone_capable'))
 
 
-def _supported_modes_for(light: Optional[LifxLight] = None, mapping: Optional[Dict] = None) -> List[str]:
+def _supported_modes_for(light: Optional[MappedDevice] = None, mapping: Optional[Dict] = None) -> List[str]:
     capable = bool(light is not None and light.zone_capable) or _mapping_is_zone_capable(mapping)
     if not capable:
         return list(STANDARD_CHANNEL_MODES)
@@ -305,7 +324,7 @@ def _supported_modes_for(light: Optional[LifxLight] = None, mapping: Optional[Di
     return modes
 
 
-def _mode_options_for(light: Optional[LifxLight] = None, mapping: Optional[Dict] = None) -> List[Dict]:
+def _mode_options_for(light: Optional[MappedDevice] = None, mapping: Optional[Dict] = None) -> List[Dict]:
     zone_count, _width, _height = _geometry_for(light, mapping)
     options: List[Dict] = []
     for mode in _supported_modes_for(light, mapping):
@@ -404,7 +423,7 @@ def _dmx_decode_to_cmd(
 
 def load_config():
     """Load configuration (mappings and settings) from file"""
-    global light_mappings, lifx_interface, sacn_interface
+    global light_mappings, lifx_interface, sacn_interface, nanoleaf_auth
     try:
         with open(CONFIG_FILE, 'r') as f:
             content = f.read().strip()
@@ -413,6 +432,7 @@ def load_config():
                 light_mappings = {}
                 lifx_interface = None
                 sacn_interface = None
+                nanoleaf_auth = {}
                 invalidate_dmx_mapping_cache()
                 return
             
@@ -421,29 +441,336 @@ def load_config():
             settings = config.get('settings', {})
             lifx_interface = settings.get('lifx_interface', None)
             sacn_interface = settings.get('sacn_interface', None)
+            nanoleaf_auth = _sanitize_nanoleaf_auth(settings.get('nanoleaf_auth', {}))
+            _import_nanoleaf_tokens_from_mappings()
     except FileNotFoundError:
         light_mappings = {}
         lifx_interface = None
         sacn_interface = None
+        nanoleaf_auth = {}
     except (json.JSONDecodeError, ValueError) as e:
         print(f"Warning: Error parsing config.json: {e}. Using empty configuration.")
         light_mappings = {}
         lifx_interface = None
         sacn_interface = None
+        nanoleaf_auth = {}
     invalidate_dmx_mapping_cache()
 
 
 def save_config():
     """Save configuration (mappings and settings) to file"""
-    config = {
-        'mappings': light_mappings,
-        'settings': {
-            'lifx_interface': lifx_interface,
-            'sacn_interface': sacn_interface
+    with _config_lock:
+        payload = json.dumps({
+            'mappings': light_mappings,
+            'settings': {
+                'lifx_interface': lifx_interface,
+                'sacn_interface': sacn_interface,
+                'nanoleaf_auth': nanoleaf_auth,
+            }
+        }, indent=2)
+        directory = os.path.dirname(os.path.abspath(CONFIG_FILE)) or '.'
+        fd, tmp_path = tempfile.mkstemp(prefix='config.', suffix='.tmp', dir=directory)
+        try:
+            with os.fdopen(fd, 'w') as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp_path, CONFIG_FILE_MODE)
+            os.replace(tmp_path, CONFIG_FILE)
+            os.chmod(CONFIG_FILE, CONFIG_FILE_MODE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+
+def _sanitize_nanoleaf_auth(raw) -> Dict[str, Dict]:
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: Dict[str, Dict] = {}
+    for device_id, record in raw.items():
+        if not isinstance(device_id, str) or not isinstance(record, dict):
+            continue
+        token = record.get('auth_token')
+        if not isinstance(token, str) or not token:
+            continue
+        port = record.get('port', DEFAULT_API_PORT)
+        try:
+            port_int = int(port)
+        except (TypeError, ValueError):
+            port_int = DEFAULT_API_PORT
+        cleaned[device_id] = {
+            'auth_token': token,
+            'ip': str(record.get('ip') or ''),
+            'port': port_int,
         }
+    return cleaned
+
+
+def _import_nanoleaf_tokens_from_mappings() -> None:
+    """Copy tokens stored on mappings into settings so pairing survives unmapping."""
+    with _config_lock:
+        for lid, mapping in light_mappings.items():
+            if _mapping_vendor(lid, mapping) != 'nanoleaf':
+                continue
+            token = mapping.get('auth_token')
+            if not isinstance(token, str) or not token:
+                continue
+            existing = nanoleaf_auth.get(lid, {})
+            nanoleaf_auth[lid] = {
+                'auth_token': token,
+                'ip': mapping.get('ip') or existing.get('ip') or '',
+                'port': mapping.get('port') or existing.get('port') or DEFAULT_API_PORT,
+            }
+            mapping.pop('auth_token', None)
+
+
+def _store_nanoleaf_auth(device: NanoleafDevice) -> None:
+    if not device.auth_token:
+        return
+    nanoleaf_auth[device.id] = {
+        'auth_token': device.auth_token,
+        'ip': device.ip,
+        'port': device.port,
     }
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
+
+
+_GENERIC_MODEL_LABELS = frozenset({
+    '',
+    'unknown',
+    'unknown model',
+    'not discovered',
+    'nanoleaf',
+    'lifx',
+})
+
+
+def _is_generic_model_label(name: Optional[str]) -> bool:
+    return str(name or '').strip().lower() in _GENERIC_MODEL_LABELS
+
+
+def _display_model(
+    light: Optional[MappedDevice] = None,
+    mapping: Optional[Dict] = None,
+) -> str:
+    """Specific product name for the UI. Never repeat the vendor brand as the model."""
+    names = []
+    if light is not None:
+        names.append(getattr(light, 'model_name', None) or '')
+    if mapping:
+        names.append(mapping.get('model') or '')
+    for name in names:
+        text = str(name or '').strip()
+        if text and not _is_generic_model_label(text):
+            return text
+    return 'Unknown model'
+
+
+def _panel_ids_from_layout(layout: Sequence) -> Tuple[List[int], Optional[str]]:
+    """Return numeric panel ids from a stored layout, or a client-facing error."""
+    ids: List[int] = []
+    for panel in layout:
+        if not isinstance(panel, dict) or 'id' not in panel:
+            return [], 'Panel layout is missing panel ids'
+        try:
+            ids.append(int(panel['id']))
+        except (TypeError, ValueError):
+            return [], 'Panel layout contains a non-numeric panel id'
+    return ids, None
+
+
+def _write_nanoleaf_layout_to_mapping(device: NanoleafDevice) -> bool:
+    """Copy live panel geometry onto a saved mapping. True if the mapping changed."""
+    mapping = light_mappings.get(device.id)
+    if mapping is None or not device.panel_ids:
+        return False
+    zone_fields = _light_zone_fields(device, mapping)
+    next_values = {
+        'vendor': 'nanoleaf',
+        'ip': device.ip or mapping.get('ip'),
+        'port': device.port,
+        'model': _display_model(device, mapping),
+        'panel_ids': list(device.panel_ids),
+        'panel_layout': [dict(panel) for panel in device.panel_layout],
+        'map_rotation': normalize_map_rotation(device.map_rotation),
+        'side_length': device.side_length,
+        'zone_capable': zone_fields['zone_capable'],
+        'zone_count': zone_fields['zone_count'],
+        'zone_layout': zone_fields['zone_layout'],
+        'matrix_width': zone_fields['matrix_width'],
+        'matrix_height': zone_fields['matrix_height'],
+    }
+    if not mapping.get('label') or mapping.get('label', '').startswith('Light '):
+        if device.label:
+            next_values['label'] = device.label
+    changed = False
+    for key, value in next_values.items():
+        if mapping.get(key) != value:
+            mapping[key] = value
+            changed = True
+    return changed
+
+
+def _hydrate_nanoleaf_devices() -> None:
+    """Attach tokens and fetch panel layouts so pixel modes and streaming work."""
+    if not nanoleaf_auth and not any(
+        _mapping_vendor(lid, mapping) == 'nanoleaf' for lid, mapping in light_mappings.items()
+    ):
+        return
+    nl_client = _ensure_nanoleaf_client()
+    changed = False
+    for device in nl_client.get_devices():
+        if not device.auth_token:
+            record = nanoleaf_auth.get(device.id, {})
+            if record.get('auth_token'):
+                device.auth_token = record['auth_token']
+        mapping = light_mappings.get(device.id, {})
+        stored_ids = mapping.get('panel_ids') or []
+        stored_layout = mapping.get('panel_layout') or []
+        device.map_rotation = normalize_map_rotation(
+            mapping.get('map_rotation', device.map_rotation)
+        )
+        if not device.panel_ids and stored_ids:
+            device.panel_ids = [int(panel_id) for panel_id in stored_ids]
+            device.layout = mapping.get('zone_layout') or device.layout
+            device.matrix_width = _int_or(mapping.get('matrix_width'), 1)
+            device.matrix_height = _int_or(mapping.get('matrix_height'), 1)
+        if not device.panel_layout and stored_layout:
+            device.panel_layout = [dict(panel) for panel in stored_layout]
+            device.side_length = _int_or(mapping.get('side_length'), device.side_length)
+        if device.auth_token and (not device.panel_ids or not device.panel_layout or not device.model):
+            nl_client.ensure_layout(device)
+        if stored_ids or device.panel_layout:
+            apply_panel_order(device, stored_ids or device.panel_ids, device.map_rotation)
+        if device.auth_token:
+            nl_client.prepare_streaming(device)
+        with _config_lock:
+            if _write_nanoleaf_layout_to_mapping(device):
+                changed = True
+    if changed:
+        invalidate_dmx_mapping_cache()
+        save_config()
+
+
+_nl_hydrate_lock = threading.Lock()
+_nl_hydrate_in_flight = False
+
+
+def _schedule_nanoleaf_hydrate() -> None:
+    """Run layout/token hydration off the GET /api/lights path."""
+    global _nl_hydrate_in_flight
+    if not nanoleaf_auth and not any(
+        _mapping_vendor(lid, mapping) == 'nanoleaf' for lid, mapping in light_mappings.items()
+    ):
+        return
+    with _nl_hydrate_lock:
+        if _nl_hydrate_in_flight:
+            return
+        _nl_hydrate_in_flight = True
+
+    def _run() -> None:
+        global _nl_hydrate_in_flight
+        try:
+            _hydrate_nanoleaf_devices()
+        finally:
+            with _nl_hydrate_lock:
+                _nl_hydrate_in_flight = False
+
+    worker = threading.Thread(target=_run, daemon=True, name='nanoleaf_hydrate')
+    try:
+        worker.start()
+    except Exception:
+        with _nl_hydrate_lock:
+            _nl_hydrate_in_flight = False
+        raise
+
+
+_lifx_hydrate_lock = threading.Lock()
+_lifx_hydrate_in_flight = False
+_lifx_probe_next_attempt: Dict[str, float] = {}
+LIFX_PROBE_BACKOFF_S = 5.0
+
+
+def _schedule_lifx_hydrate() -> None:
+    """Re-probe missing mapped LIFX bulbs off the GET /api/lights path."""
+    global _lifx_hydrate_in_flight
+    if lifx_client is None:
+        return
+    with _lifx_hydrate_lock:
+        if _lifx_hydrate_in_flight:
+            return
+        _lifx_hydrate_in_flight = True
+
+    def _run() -> None:
+        global _lifx_hydrate_in_flight
+        try:
+            _hydrate_lifx_devices()
+        finally:
+            with _lifx_hydrate_lock:
+                _lifx_hydrate_in_flight = False
+
+    worker = threading.Thread(target=_run, daemon=True, name='lifx_hydrate')
+    try:
+        worker.start()
+    except Exception:
+        with _lifx_hydrate_lock:
+            _lifx_hydrate_in_flight = False
+        raise
+
+
+def _hydrate_lifx_devices() -> None:
+    """Re-probe mapped LIFX bulbs that are missing from the live client."""
+    if lifx_client is None:
+        return
+    probe = getattr(lifx_client, 'probe_light_by_ip', None)
+    if not callable(probe):
+        return
+    present = set()
+    with lifx_client.lock:
+        for light in lifx_client.lights.values():
+            present.add(light_id(light))
+            if light.ip:
+                present.add(light.ip)
+    now = time.time()
+    for lid, mapping in light_mappings.items():
+        if _mapping_vendor(lid, mapping) != 'lifx':
+            continue
+        ip = mapping.get('ip')
+        if not ip or ip == 'Not discovered':
+            continue
+        if lid in present or ip in present:
+            _lifx_probe_next_attempt.pop(ip, None)
+            continue
+        if now < _lifx_probe_next_attempt.get(ip, 0.0):
+            continue
+        try:
+            found = probe(ip, timeout=0.6)
+        except Exception as exc:
+            print(f'LIFX probe failed for {ip}: {exc}')
+            _lifx_probe_next_attempt[ip] = time.time() + LIFX_PROBE_BACKOFF_S
+            continue
+        if found is not None:
+            present.add(light_id(found))
+            if found.ip:
+                present.add(found.ip)
+            _lifx_probe_next_attempt.pop(ip, None)
+        else:
+            _lifx_probe_next_attempt[ip] = time.time() + LIFX_PROBE_BACKOFF_S
+
+
+def _mapping_vendor(lid: str, mapping: Optional[Dict] = None) -> Vendor:
+    stored = (mapping or {}).get('vendor')
+    if stored == 'nanoleaf' or (isinstance(lid, str) and lid.startswith('nl_')):
+        return 'nanoleaf'
+    return 'lifx'
+
+
+def _device_vendor(device: Optional[MappedDevice], mapping: Optional[Dict] = None, lid: str = '') -> Vendor:
+    if device is not None and getattr(device, 'vendor', 'lifx') == 'nanoleaf':
+        return 'nanoleaf'
+    return _mapping_vendor(lid, mapping)
 
 
 # Deprecated functions removed - use load_config() and save_config() directly
@@ -506,12 +833,42 @@ def get_network_interfaces():
     return interfaces
 
 
-def light_id(light: LifxLight) -> str:
+def light_id(light: MappedDevice) -> str:
     """Generate unique ID for a light"""
+    if getattr(light, 'vendor', None) == 'nanoleaf':
+        return light.id
     return light.target.hex()
 
 
-def _display_label(light: Optional[LifxLight], mapping: Optional[Dict] = None, lid: str = '') -> str:
+def _find_mapped_device(lid: str, mapping: Optional[Dict] = None) -> Optional[MappedDevice]:
+    """Resolve a mapping to a live device. LIFX also matches the saved IP."""
+    mapping = mapping if mapping is not None else light_mappings.get(lid)
+    vendor = _mapping_vendor(lid, mapping)
+    if vendor == 'nanoleaf':
+        client = nanoleaf_client
+        if client is None and (
+            nanoleaf_auth or (isinstance(lid, str) and lid.startswith('nl_'))
+        ):
+            client = _ensure_nanoleaf_client()
+        if client is None:
+            return None
+        return client.get_device(lid)
+    if lifx_client is None:
+        return None
+    with lifx_client.lock:
+        lights = list(lifx_client.lights.values())
+    for light in lights:
+        if light_id(light) == lid:
+            return light
+    ip = (mapping or {}).get('ip')
+    if ip and ip != 'Not discovered':
+        for light in lights:
+            if light.ip == ip:
+                return light
+    return None
+
+
+def _display_label(light: Optional[MappedDevice], mapping: Optional[Dict] = None, lid: str = '') -> str:
     stored = (mapping or {}).get('label')
     if isinstance(stored, str):
         stored = stored.strip()
@@ -526,13 +883,20 @@ def _display_label(light: Optional[LifxLight], mapping: Optional[Dict] = None, l
     return 'Light'
 
 
-def _light_summary(light: LifxLight, lid: Optional[str] = None) -> Dict:
+def _light_summary(light: MappedDevice, lid: Optional[str] = None, mapping: Optional[Dict] = None) -> Dict:
     resolved_id = lid or light_id(light)
+    vendor = _device_vendor(light, mapping, lid=resolved_id)
     return {
         'id': resolved_id,
         'label': light.label or f"Light {light.ip}",
         'ip': light.ip,
-        'model': light.model_name,
+        'model': _display_model(light, mapping),
+        'vendor': vendor,
+        'paired': bool(getattr(light, 'paired', True)),
+        'panel_layout': [dict(panel) for panel in getattr(light, 'panel_layout', []) or []],
+        'panel_ids': list(getattr(light, 'panel_ids', []) or []),
+        'map_rotation': normalize_map_rotation(getattr(light, 'map_rotation', 0)),
+        'side_length': getattr(light, 'side_length', None),
         **_light_zone_fields(light),
     }
 
@@ -541,12 +905,12 @@ def _mapping_uses_zones(mapping: Dict) -> bool:
     return _mode_is_pixel(mapping.get('channel_mode'))
 
 
-def _physical_zone_count(mapping: Dict, light: Optional[LifxLight]) -> int:
+def _physical_zone_count(mapping: Dict, light: Optional[MappedDevice]) -> int:
     count, _width, _height = _geometry_for(light, mapping)
     return count if count > 1 else 1
 
 
-def _mapping_zone_count(mapping: Dict, light: Optional[LifxLight]) -> int:
+def _mapping_zone_count(mapping: Dict, light: Optional[MappedDevice]) -> int:
     """How many sequential DMX pixel slots to consume for pixel modes."""
     if not _mapping_uses_zones(mapping):
         return 1
@@ -560,7 +924,7 @@ def _mapping_zone_count(mapping: Dict, light: Optional[LifxLight]) -> int:
     return max(1, groups)
 
 
-def _mapping_channels_needed(mapping: Dict, light: Optional[LifxLight]) -> int:
+def _mapping_channels_needed(mapping: Dict, light: Optional[MappedDevice]) -> int:
     channel_mode = _normalize_channel_mode(mapping.get('channel_mode'))
     return _channels_per_cell(channel_mode) * _mapping_zone_count(mapping, light)
 
@@ -596,7 +960,7 @@ def _rainbow_cells(count: int, brightness: float) -> List[Tuple[float, float, fl
     return [_hsv_cell(i / n, brightness) for i in range(n)]
 
 
-def _pixel_test_patterns(light: Optional[LifxLight], mapping: Optional[Dict] = None) -> List[Dict[str, str]]:
+def _pixel_test_patterns(light: Optional[MappedDevice], mapping: Optional[Dict] = None) -> List[Dict[str, str]]:
     if light is None or not light.zone_capable:
         return []
     count, width, height = _geometry_for(light, mapping)
@@ -616,7 +980,7 @@ def _pixel_test_patterns(light: Optional[LifxLight], mapping: Optional[Dict] = N
 
 
 def _pixel_test_commands(
-    light: LifxLight,
+    light: MappedDevice,
     pattern: str,
     brightness: float,
     chase_index: int = 0,
@@ -648,7 +1012,7 @@ def _pixel_test_commands(
     return []
 
 
-def _light_zone_fields(light: Optional[LifxLight], mapping: Optional[Dict] = None) -> Dict:
+def _light_zone_fields(light: Optional[MappedDevice], mapping: Optional[Dict] = None) -> Dict:
     if light is not None:
         layout = light.effective_layout
         count, width, height = _geometry_for(light, mapping)
@@ -672,28 +1036,45 @@ def _light_zone_fields(light: Optional[LifxLight], mapping: Optional[Dict] = Non
     }
 
 
-def _configured_light_row(lid: str, mapping: Dict, light: Optional[LifxLight]) -> Dict:
+def _public_mapping(mapping: Optional[Dict]) -> Dict:
+    """Copy a mapping for API responses without the Nanoleaf auth token."""
+    public = dict(mapping or {})
+    public.pop('auth_token', None)
+    return public
+
+
+def _configured_light_row(lid: str, mapping: Dict, light: Optional[MappedDevice]) -> Dict:
+    vendor = _device_vendor(light, mapping, lid)
+    public_mapping = _public_mapping(mapping)
     if light:
         return {
-            **_light_summary(light, lid),
+            **_light_summary(light, lid, mapping),
             **_light_zone_fields(light, mapping),
             'label': _display_label(light, mapping, lid),
             'discovered': True,
+            'vendor': vendor,
+            'paired': bool(getattr(light, 'paired', True)),
             'supported_modes': _supported_modes_for(light, mapping),
             'mode_options': _mode_options_for(light, mapping),
             'pixel_test_patterns': _pixel_test_patterns(light, mapping),
-            'mapping': mapping,
+            'mapping': public_mapping,
         }
     return {
         'id': lid,
         'label': _display_label(None, mapping, lid),
         'ip': mapping.get('ip') or '',
-        'model': mapping.get('model') or 'Unknown',
+        'model': _display_model(None, mapping),
         'discovered': False,
+        'vendor': vendor,
+        'paired': bool(nanoleaf_auth.get(lid, {}).get('auth_token') or mapping.get('auth_token')) if vendor == 'nanoleaf' else True,
         'supported_modes': _supported_modes_for(None, mapping),
         'mode_options': _mode_options_for(None, mapping),
         'pixel_test_patterns': [],
-        'mapping': mapping,
+        'mapping': public_mapping,
+        'panel_layout': [dict(panel) for panel in mapping.get('panel_layout') or []],
+        'panel_ids': list(mapping.get('panel_ids') or []),
+        'map_rotation': normalize_map_rotation(mapping.get('map_rotation', 0)),
+        'side_length': mapping.get('side_length'),
         **_light_zone_fields(None, mapping),
     }
 
@@ -748,6 +1129,21 @@ _batch_sender_stop: threading.Event = threading.Event()
 _batch_sender_wake = threading.Event()
 _batch_sender_start_lock = threading.Lock()
 
+# Nanoleaf Open API caps external control at 10Hz.
+_nl_batch_commands_by_id: Dict[str, tuple] = {}
+_nl_batch_lock = threading.Lock()
+_nl_last_batch_time = 0.0
+try:
+    NANOLEAF_BATCH_INTERVAL = max(0.05, float(os.getenv('NANOLEAF_BATCH_INTERVAL_MS', '100')) / 1000.0)
+except ValueError:
+    print("Warning: Invalid NANOLEAF_BATCH_INTERVAL_MS; using default 100")
+    NANOLEAF_BATCH_INTERVAL = 0.1
+_nl_batch_sender_thread: Optional[threading.Thread] = None
+_nl_batch_sender_stop: threading.Event = threading.Event()
+_nl_batch_sender_wake = threading.Event()
+_nl_batch_sender_start_lock = threading.Lock()
+_nl_batch_executor: Optional[ThreadPoolExecutor] = None
+
 # Performance monitoring for multi-fixture setups
 _perf_metrics = {
     'total_frames_processed': 0,
@@ -768,6 +1164,15 @@ _PERF_RATE_WINDOW_S = 5.0
 _perf_rate_frames: deque = deque(maxlen=1000)
 _perf_rate_commands: deque = deque(maxlen=1000)  # (timestamp, command_count)
 _perf_rate_batches: deque = deque(maxlen=1000)
+_nl_perf_metrics = {
+    'total_commands_sent': 0,
+    'total_batches_sent': 0,
+    'avg_batch_size': 0.0,
+    'batch_sizes': deque(maxlen=50),
+    'last_drain_duration_s': 0.0,
+    'peak_drain_duration_s': 0.0,
+    'drain_overrun_count': 0,
+}
 
 
 def _rolling_per_second(events: deque, now: float, counted: bool = False) -> float:
@@ -917,11 +1322,187 @@ def _stop_lifx_batch_sender_thread():
     t.join(timeout=1.0)
 
 
+def _nl_send_batch_item(item) -> None:
+    """Send one queued Nanoleaf command; log failures without raising."""
+    try:
+        kind = item[0]
+        if kind == 'nl_zones':
+            _kind, device, zone_cmds, _duration_ms = item
+            nanoleaf_client.send_zones(device, zone_cmds)
+        elif kind == 'nl_color':
+            _kind, device, r, g, b, _kelvin, _duration_ms, brightness = item
+            nanoleaf_client.send_color(device, r, g, b, brightness)
+        else:
+            unreachable: str = kind
+            raise ValueError(f'Unhandled Nanoleaf batch kind: {unreachable}')
+    except Exception as exc:
+        device = item[1] if len(item) > 1 else None
+        label = getattr(device, 'label', None) or getattr(device, 'ip', None) or 'unknown'
+        msg = f"Error in Nanoleaf batch send for {label}: {exc}"
+        if dmx_logger:
+            dmx_logger.warning(msg)
+        else:
+            print(msg)
+
+
+def _nl_send_one_batch():
+    """Drain pending Nanoleaf commands if the 10Hz interval has elapsed."""
+    global _nl_batch_commands_by_id, _nl_last_batch_time, _nl_perf_metrics
+
+    if not nanoleaf_client:
+        return
+
+    current_time = time.time()
+    if current_time - _nl_last_batch_time < NANOLEAF_BATCH_INTERVAL:
+        return
+
+    with _nl_batch_lock:
+        if not _nl_batch_commands_by_id:
+            return
+        batch = list(_nl_batch_commands_by_id.values())
+        _nl_batch_commands_by_id.clear()
+
+    if not batch:
+        return
+
+    drain_start = time.time()
+    workers = min(NANOLEAF_BATCH_WORKERS, len(batch))
+    futures = None
+    with _nl_batch_sender_start_lock:
+        executor = _nl_batch_executor
+        if workers > 1 and executor is not None:
+            futures = [executor.submit(_nl_send_batch_item, item) for item in batch]
+    if futures is None:
+        for item in batch:
+            _nl_send_batch_item(item)
+    else:
+        for future in as_completed(futures):
+            future.result()
+
+    _nl_last_batch_time = current_time
+    drain_duration = time.time() - drain_start
+    with _perf_lock:
+        _nl_perf_metrics['total_batches_sent'] += 1
+        _nl_perf_metrics['total_commands_sent'] += len(batch)
+        _nl_perf_metrics['batch_sizes'].append(len(batch))
+        if len(_nl_perf_metrics['batch_sizes']) > 0:
+            _nl_perf_metrics['avg_batch_size'] = (
+                sum(_nl_perf_metrics['batch_sizes']) / len(_nl_perf_metrics['batch_sizes'])
+            )
+        _nl_perf_metrics['last_drain_duration_s'] = drain_duration
+        if drain_duration > _nl_perf_metrics['peak_drain_duration_s']:
+            _nl_perf_metrics['peak_drain_duration_s'] = drain_duration
+        if drain_duration > NANOLEAF_BATCH_INTERVAL:
+            _nl_perf_metrics['drain_overrun_count'] += 1
+
+
+def _nl_batch_sender_worker(stop_event: threading.Event):
+    while True:
+        if stop_event.is_set():
+            break
+        with _nl_batch_lock:
+            pending = len(_nl_batch_commands_by_id) > 0
+        if pending:
+            wait_for = max(0.0, NANOLEAF_BATCH_INTERVAL - (time.time() - _nl_last_batch_time))
+            timeout = min(max(wait_for, 0.0005), NANOLEAF_BATCH_INTERVAL)
+        else:
+            timeout = 0.1
+        _nl_batch_sender_wake.wait(timeout=timeout)
+        if stop_event.is_set():
+            break
+        _nl_batch_sender_wake.clear()
+        while not stop_event.is_set():
+            if not nanoleaf_client:
+                break
+            with _nl_batch_lock:
+                if not _nl_batch_commands_by_id:
+                    break
+            if time.time() - _nl_last_batch_time < NANOLEAF_BATCH_INTERVAL:
+                break
+            _nl_send_one_batch()
+
+
+def _start_nl_batch_sender_thread():
+    global _nl_batch_sender_thread, _nl_batch_sender_stop, _nl_batch_sender_wake, _nl_batch_executor
+
+    with _nl_batch_sender_start_lock:
+        if _nl_batch_sender_thread is not None and _nl_batch_sender_thread.is_alive():
+            return
+        if _nl_batch_executor is None:
+            _nl_batch_executor = ThreadPoolExecutor(
+                max_workers=NANOLEAF_BATCH_WORKERS,
+                thread_name_prefix='nl_batch',
+            )
+        stop_event = threading.Event()
+        _nl_batch_sender_stop = stop_event
+        _nl_batch_sender_wake.clear()
+        t = threading.Thread(
+            target=_nl_batch_sender_worker,
+            args=(stop_event,),
+            daemon=True,
+            name='nanoleaf_batch_sender',
+        )
+        _nl_batch_sender_thread = t
+        t.start()
+
+
+def _stop_nl_batch_sender_thread():
+    global _nl_batch_sender_thread, _nl_batch_executor
+
+    with _nl_batch_sender_start_lock:
+        t = _nl_batch_sender_thread
+        executor = _nl_batch_executor
+        _nl_batch_executor = None
+        if t is None:
+            if executor is not None:
+                executor.shutdown(wait=False)
+            return
+        with _nl_batch_lock:
+            _nl_batch_commands_by_id.clear()
+        _nl_batch_sender_stop.set()
+        _nl_batch_sender_wake.set()
+        _nl_batch_sender_thread = None
+    t.join(timeout=1.0)
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+
+def _ensure_nanoleaf_client() -> NanoleafClient:
+    global nanoleaf_client
+    bind_ip = _normalize_interface_ip(lifx_interface)
+    if nanoleaf_client is None:
+        nanoleaf_client = NanoleafClient(bind_ip=bind_ip)
+        nanoleaf_client.apply_auth(nanoleaf_auth)
+    elif getattr(nanoleaf_client, 'requested_bind_ip', None) != bind_ip:
+        nanoleaf_client.close()
+        nanoleaf_client = NanoleafClient(bind_ip=bind_ip)
+        nanoleaf_client.apply_auth(nanoleaf_auth)
+    return nanoleaf_client
+
+
+def _enqueue_device_command(cmd: tuple) -> None:
+    """Queue a decoded colour/zone command for the matching vendor sender."""
+    device = cmd[1]
+    lid = light_id(device)
+    if _device_vendor(device, lid=lid) == 'nanoleaf':
+        with _nl_batch_lock:
+            _nl_batch_commands_by_id[lid] = cmd
+        _start_nl_batch_sender_thread()
+        _nl_batch_sender_wake.set()
+        return
+    with _batch_lock:
+        _batch_commands_by_id[lid] = cmd
+    _start_lifx_batch_sender_thread()
+    _batch_sender_wake.set()
+
+
 def process_dmx_data(dmx_data: list, universe: int):
     """Process incoming DMX data and update lights"""
     global lifx_client, light_mappings, _last_sent_values, _dmx_frame_counter
     
-    if not lifx_client or not running:
+    if not running:
+        return
+    if not lifx_client and not nanoleaf_client:
         return
     
     _rebuild_dmx_mapping_cache_if_dirty()
@@ -940,15 +1521,26 @@ def process_dmx_data(dmx_data: list, universe: int):
     if dmx_logger and enable_dmx_log:
         dmx_logger.info(f"DMX received: universe={universe}, data_len={len(dmx_data)}")
     
-    # Single lock, one pass (equivalent to former get_lights() + dict snapshot)
-    with lifx_client.lock:
-        lights_by_id = {light_id(L): L for L in lifx_client.lights.values()}
+    lights_by_id: Dict[str, MappedDevice] = {}
+    lights_by_ip: Dict[str, MappedDevice] = {}
+    if lifx_client:
+        with lifx_client.lock:
+            for found in lifx_client.lights.values():
+                lights_by_id[light_id(found)] = found
+                if found.ip:
+                    lights_by_ip[found.ip] = found
+    if nanoleaf_client:
+        for device in nanoleaf_client.get_devices():
+            if device.paired:
+                lights_by_id[device.id] = device
     
     frame_batch: List[tuple] = []
     
     for mapped_light_id, mapping in mapping_entries:
         # Find the light for this mapping
         light = lights_by_id.get(mapped_light_id)
+        if light is None and _mapping_vendor(mapped_light_id, mapping) == 'lifx':
+            light = lights_by_ip.get(mapping.get('ip') or '')
         if not light:
             continue  # Light not currently discovered
         
@@ -977,6 +1569,7 @@ def process_dmx_data(dmx_data: list, universe: int):
                 continue
         
         _last_sent_values[mapped_light_id] = list(channel_values)
+        vendor = _device_vendor(light, mapping, mapped_light_id)
         
         if zone_count > 1 or _mode_is_pixel(channel_mode):
             zone_cmds = []
@@ -994,7 +1587,8 @@ def process_dmx_data(dmx_data: list, universe: int):
                 physical, width, height = _geometry_for(light, mapping)
                 expanded = _expand_control_cells_to_zones(zone_cmds, max(physical, 1), width, height)
                 if expanded:
-                    frame_batch.append(('zones', light, expanded, duration_ms))
+                    kind = 'nl_zones' if vendor == 'nanoleaf' else 'zones'
+                    frame_batch.append((kind, light, expanded, duration_ms))
             continue
         
         cmd_data = _dmx_decode_to_cmd(channel_mode, channel_values, brightness)
@@ -1006,15 +1600,11 @@ def process_dmx_data(dmx_data: list, universe: int):
                     f"  → {light.label}: RGB=({rgb_int[0]},{rgb_int[1]},{rgb_int[2]}), "
                     f"DMX={channel_values}, brightness={cmd_data[5]:.2f}, fade={FADE_DURATION_MS}ms"
                 )
-            frame_batch.append(('color', light, *cmd_data))
+            kind = 'nl_color' if vendor == 'nanoleaf' else 'color'
+            frame_batch.append((kind, light, *cmd_data))
     
-    if frame_batch:
-        with _batch_lock:
-            for cmd in frame_batch:
-                lid = light_id(cmd[1])
-                _batch_commands_by_id[lid] = cmd
-        _start_lifx_batch_sender_thread()
-        _batch_sender_wake.set()
+    for cmd in frame_batch:
+        _enqueue_device_command(cmd)
     
     # Update performance metrics
     with _perf_lock:
@@ -1104,7 +1694,6 @@ def _restart_dmx_if_running():
                 old_receiver.stop()
             except Exception as e:
                 print(f"Error stopping DMX receiver during restart: {e}")
-                raise
             old_receiver.reset_stats()
         
         # Wait for thread to finish (may block)
@@ -1176,10 +1765,10 @@ def list_lights():
     """Return discovered lights and configured mappings for the web UI."""
     global lifx_client, light_mappings
     
-    discovered_by_id: Dict[str, LifxLight] = {}
-    lights_list: List[LifxLight] = []
+    discovered_by_id: Dict[str, MappedDevice] = {}
+    lights_list: List[MappedDevice] = []
     if lifx_client:
-        lights_list = lifx_client.get_lights()
+        lights_list.extend(lifx_client.get_lights())
         for light in lights_list:
             discovered_by_id[light_id(light)] = light
         with lifx_client.lock:
@@ -1187,9 +1776,22 @@ def list_lights():
                 lid = light_id(light)
                 if lid not in discovered_by_id and lid in light_mappings:
                     discovered_by_id[lid] = light
+    if nanoleaf_auth or any(
+        _mapping_vendor(lid, mapping) == 'nanoleaf' for lid, mapping in light_mappings.items()
+    ):
+        _schedule_nanoleaf_hydrate()
+    _schedule_lifx_hydrate()
+    if nanoleaf_client:
+        for device in nanoleaf_client.get_devices():
+            lights_list.append(device)
+            discovered_by_id[device.id] = device
     
     all_configured = [
-        _configured_light_row(lid, mapping, discovered_by_id.get(lid))
+        _configured_light_row(
+            lid,
+            mapping,
+            discovered_by_id.get(lid) or _find_mapped_device(lid, mapping),
+        )
         for lid, mapping in light_mappings.items()
     ]
     unconfigured = [
@@ -1243,6 +1845,7 @@ def _interfaces_payload():
         'interfaces': _interfaces_cache if _interfaces_cache is not None else [],
         'lifx_interface': lifx_interface,
         'sacn_interface': sacn_interface,
+        'discovery_interface': lifx_interface,
     }
 
 
@@ -1301,7 +1904,7 @@ def set_interfaces():
 @app.route('/api/settings/interfaces/apply', methods=['POST'])
 def apply_interfaces():
     """Apply the network interface settings (recreate clients)"""
-    global lifx_client, dmx_receiver
+    global lifx_client, dmx_receiver, nanoleaf_client
     
     lifx_bind_ip = _normalize_interface_ip(lifx_interface)
     sacn_bind_ip = _sacn_bind_ip()
@@ -1314,6 +1917,11 @@ def apply_interfaces():
         except OSError as e:
             lifx_client = None
             return jsonify({"success": False, "error": str(e)}), 500
+
+    if nanoleaf_client:
+        nanoleaf_client.close()
+        nanoleaf_client = NanoleafClient(bind_ip=lifx_bind_ip)
+        nanoleaf_client.apply_auth(nanoleaf_auth)
     
     # Recreate DMX receiver with new interface if it exists
     if dmx_receiver:
@@ -1328,7 +1936,7 @@ def apply_interfaces():
 
 @app.route('/api/lights/discover', methods=['POST'])
 def discover_lights():
-    """Discover LIFX lights on the network"""
+    """Discover LIFX and Nanoleaf lights on the network"""
     global lifx_client
     
     lifx_bind_ip = _normalize_interface_ip(lifx_interface)
@@ -1345,9 +1953,20 @@ def discover_lights():
         except OSError as e:
             lifx_client = None
             return jsonify({"success": False, "error": str(e)}), 500
+
+    nl_client = _ensure_nanoleaf_client()
     
     try:
         lights = lifx_client.discover_lights(timeout=5.0)
+        _hydrate_lifx_devices()
+        nanoleaf_devices = nl_client.discover(timeout=4.0)
+        for device in nanoleaf_devices:
+            if device.paired:
+                try:
+                    nl_client.refresh_info(device)
+                except NanoleafError as exc:
+                    print(f"Nanoleaf refresh failed for {device.ip}: {exc}")
+        _hydrate_nanoleaf_devices()
         lights_data = [
             {
                 **_light_summary(light),
@@ -1358,6 +1977,15 @@ def discover_lights():
             }
             for light in lights
         ]
+        lights_data.extend([
+            {
+                **_light_summary(device),
+                'supported_modes': _supported_modes_for(device),
+                'mode_options': _mode_options_for(device),
+                'pixel_test_patterns': _pixel_test_patterns(device),
+            }
+            for device in nanoleaf_devices
+        ])
         return jsonify({'success': True, 'lights': lights_data})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1434,6 +2062,19 @@ def update_mapping():
                     if not light_label:
                         light_label = light.label
                     break
+        if matched_light is None and (
+            _mapping_vendor(mapped_light_id, existing_mapping) == 'nanoleaf'
+            or (isinstance(mapped_light_id, str) and mapped_light_id.startswith('nl_'))
+        ):
+            nl_client = _ensure_nanoleaf_client()
+            device = nl_client.get_device(mapped_light_id)
+            if device is not None:
+                nl_client.ensure_layout(device)
+                light_model = device.model_name or light_model
+                light_ip = device.ip or light_ip
+                matched_light = device
+                if not light_label:
+                    light_label = device.label
 
         requested_label = data.get('label')
         if isinstance(requested_label, str):
@@ -1485,6 +2126,7 @@ def update_mapping():
                 if mode_str is None:
                     mode_str = supported_modes[0] if supported_modes else 'RGB (8bit)'
         zone_fields = _light_zone_fields(matched_light, existing_mapping)
+        vendor = _device_vendor(matched_light, existing_mapping, mapped_light_id)
         mapping = {
             'universe': universe_int,
             'start_channel': start_channel_int,
@@ -1493,22 +2135,49 @@ def update_mapping():
             'label': light_label,  # Store label for display when not discovered
             'model': light_model,  # Store model for display when not discovered
             'ip': light_ip,  # Store IP for auto-discovery
+            'vendor': vendor,
             'zone_capable': zone_fields['zone_capable'],
             'zone_count': zone_fields['zone_count'],
             'zone_layout': zone_fields['zone_layout'],
             'matrix_width': zone_fields['matrix_width'],
             'matrix_height': zone_fields['matrix_height'],
         }
-        
-        light_mappings[mapped_light_id] = mapping
-        _last_sent_values.pop(mapped_light_id, None)
-        invalidate_dmx_mapping_cache()
-        save_config()
+        token = None
+        if vendor == 'nanoleaf':
+            token = existing_mapping.get('auth_token') or nanoleaf_auth.get(mapped_light_id, {}).get('auth_token')
+            if matched_light is not None:
+                token = getattr(matched_light, 'auth_token', None) or token
+                mapping['port'] = getattr(matched_light, 'port', existing_mapping.get('port', DEFAULT_API_PORT))
+                mapping['panel_ids'] = list(getattr(matched_light, 'panel_ids', []) or existing_mapping.get('panel_ids') or [])
+                mapping['panel_layout'] = [dict(panel) for panel in getattr(matched_light, 'panel_layout', []) or existing_mapping.get('panel_layout') or []]
+                mapping['map_rotation'] = normalize_map_rotation(
+                    getattr(matched_light, 'map_rotation', existing_mapping.get('map_rotation', 0))
+                )
+                mapping['side_length'] = getattr(matched_light, 'side_length', existing_mapping.get('side_length'))
+            else:
+                mapping['port'] = existing_mapping.get('port', DEFAULT_API_PORT)
+                mapping['panel_ids'] = list(existing_mapping.get('panel_ids') or [])
+                mapping['panel_layout'] = [dict(panel) for panel in existing_mapping.get('panel_layout') or []]
+                mapping['map_rotation'] = normalize_map_rotation(existing_mapping.get('map_rotation', 0))
+                mapping['side_length'] = existing_mapping.get('side_length')
+        mapping.pop('auth_token', None)
+        with _config_lock:
+            if vendor == 'nanoleaf' and token:
+                record = nanoleaf_auth.get(mapped_light_id, {})
+                nanoleaf_auth[mapped_light_id] = {
+                    'auth_token': token,
+                    'ip': mapping.get('ip') or record.get('ip') or '',
+                    'port': mapping.get('port') or record.get('port') or DEFAULT_API_PORT,
+                }
+            light_mappings[mapped_light_id] = mapping
+            _last_sent_values.pop(mapped_light_id, None)
+            invalidate_dmx_mapping_cache()
+            save_config()
         
         # Restart DMX worker if running
         _restart_dmx_if_running()
         
-        return jsonify({'success': True, 'mapping': mapping})
+        return jsonify({'success': True, 'mapping': _public_mapping(mapping)})
     
     except Exception as e:
         return jsonify({'success': False, 'error': f'Server error: {str(e)}'}), 500
@@ -1518,19 +2187,192 @@ def update_mapping():
 def delete_mapping(light_id):
     """Delete mapping for a light"""
     global light_mappings
-    
-    if light_id in light_mappings:
+
+    with _config_lock:
+        if light_id not in light_mappings:
+            return jsonify({'success': False, 'error': 'Mapping not found'}), 404
         del light_mappings[light_id]
         _last_sent_values.pop(light_id, None)
         invalidate_dmx_mapping_cache()
         save_config()
-        
-        # Restart DMX worker if running
-        _restart_dmx_if_running()
-        
-        return jsonify({'success': True})
+
+    _restart_dmx_if_running()
+    return jsonify({'success': True})
+
+
+@app.route('/api/nanoleaf/pair', methods=['POST'])
+def pair_nanoleaf():
+    """Create an Open API token after the controller pairing button is held."""
+    data = request.get_json() or {}
+    requested_id = data.get('light_id')
+    ip = (data.get('ip') or '').strip()
+    if not requested_id and not ip:
+        return jsonify({'success': False, 'error': 'light_id or ip is required'}), 400
+
+    nl_client = _ensure_nanoleaf_client()
+    device = nl_client.get_device(requested_id) if requested_id else None
+    if device is None and ip:
+        try:
+            socket.inet_aton(ip)
+        except OSError:
+            return jsonify({'success': False, 'error': 'Invalid IP address format'}), 400
+        raw_port = data.get('port')
+        if raw_port is None or raw_port == '':
+            raw_port = DEFAULT_API_PORT
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Invalid port'}), 400
+        if port < 1 or port > 65535:
+            return jsonify({'success': False, 'error': 'Invalid port'}), 400
+        device = nl_client.probe_by_ip(ip, port=port)
+    if device is None:
+        return jsonify({'success': False, 'error': 'Nanoleaf device not found. Discover first or add by IP.'}), 404
+
+    try:
+        nl_client.pair(device)
+    except NanoleafError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+
+    with _config_lock:
+        _store_nanoleaf_auth(device)
+        if device.id in light_mappings:
+            mapping = dict(light_mappings[device.id])
+            mapping['vendor'] = 'nanoleaf'
+            mapping.pop('auth_token', None)
+            mapping['ip'] = device.ip
+            mapping['port'] = device.port
+            mapping['model'] = device.model_name
+            mapping['label'] = mapping.get('label') or device.label
+            mapping.update(_light_zone_fields(device, mapping))
+            mapping['panel_ids'] = list(device.panel_ids)
+            mapping['panel_layout'] = [dict(panel) for panel in device.panel_layout]
+            mapping['map_rotation'] = normalize_map_rotation(device.map_rotation)
+            mapping['side_length'] = device.side_length
+            light_mappings[device.id] = mapping
+            invalidate_dmx_mapping_cache()
+        save_config()
+    return jsonify({
+        'success': True,
+        'light': {
+            **_light_summary(device),
+            'supported_modes': _supported_modes_for(device),
+            'mode_options': _mode_options_for(device),
+            'pixel_test_patterns': _pixel_test_patterns(device),
+        },
+    })
+
+
+@app.route('/api/lights/addressing', methods=['POST'])
+def update_panel_addressing():
+    """Rotate the Nanoleaf map and/or set pixel order."""
+    data = request.get_json() or {}
+    requested_id = data.get('light_id')
+    if not requested_id:
+        return jsonify({'success': False, 'error': 'light_id is required'}), 400
+
+    mapping = light_mappings.get(requested_id)
+    device = None
+    if nanoleaf_client is not None:
+        device = nanoleaf_client.get_device(requested_id)
+    if device is None and mapping is None:
+        return jsonify({'success': False, 'error': 'Light not found'}), 404
+    if device is None and _mapping_vendor(requested_id, mapping) != 'nanoleaf':
+        return jsonify({'success': False, 'error': 'Only Nanoleaf fixtures have a panel map'}), 400
+
+    layout = []
+    if device is not None and device.panel_layout:
+        layout = [dict(panel) for panel in device.panel_layout]
+    elif mapping:
+        layout = [dict(panel) for panel in mapping.get('panel_layout') or []]
+    if len(layout) < 2:
+        return jsonify({'success': False, 'error': 'No panel layout to address'}), 400
+
+    if 'map_rotation' in data:
+        rotation = normalize_map_rotation(data.get('map_rotation'))
+    elif device is not None:
+        rotation = normalize_map_rotation(device.map_rotation)
     else:
-        return jsonify({'success': False, 'error': 'Mapping not found'}), 404
+        rotation = normalize_map_rotation((mapping or {}).get('map_rotation', 0))
+
+    layout_ids, layout_error = _panel_ids_from_layout(layout)
+    if layout_error:
+        return jsonify({'success': False, 'error': layout_error}), 400
+    known = set(layout_ids)
+
+    requested_ids = data.get('panel_ids')
+    if data.get('reset_order'):
+        panel_ids = order_panel_ids(layout, rotation)
+    elif requested_ids is not None:
+        if not isinstance(requested_ids, list):
+            return jsonify({'success': False, 'error': 'panel_ids must be a list'}), 400
+        cleaned: List[int] = []
+        seen = set()
+        for raw in requested_ids:
+            try:
+                panel_id = int(raw)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'panel_ids must be integers'}), 400
+            if panel_id not in known:
+                return jsonify({'success': False, 'error': f'Unknown panel {panel_id}'}), 400
+            if panel_id not in seen:
+                cleaned.append(panel_id)
+                seen.add(panel_id)
+        if seen != known:
+            return jsonify({'success': False, 'error': 'panel_ids must include every panel once'}), 400
+        panel_ids = cleaned
+    elif device is not None and device.panel_ids:
+        panel_ids = list(device.panel_ids)
+    elif mapping and mapping.get('panel_ids'):
+        try:
+            panel_ids = [int(panel_id) for panel_id in mapping.get('panel_ids') or []]
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Stored panel_ids must be integers'}), 400
+    else:
+        panel_ids = order_panel_ids(layout, rotation)
+
+    if device is not None:
+        apply_panel_order(device, panel_ids, rotation)
+        panel_ids = list(device.panel_ids)
+        rotation = device.map_rotation
+        if not layout:
+            layout = [dict(panel) for panel in device.panel_layout]
+
+    if mapping is not None:
+        with _config_lock:
+            mapping['panel_ids'] = list(panel_ids)
+            mapping['map_rotation'] = rotation
+            mapping['panel_layout'] = layout
+            light_mappings[requested_id] = mapping
+            invalidate_dmx_mapping_cache()
+            save_config()
+
+    return jsonify({
+        'success': True,
+        'panel_ids': list(panel_ids),
+        'map_rotation': rotation,
+    })
+
+
+@app.route('/api/lights/identify', methods=['POST'])
+def identify_light():
+    """Flash a Nanoleaf controller so it can be identified on the wall."""
+    data = request.get_json() or {}
+    requested_id = data.get('light_id')
+    if not requested_id:
+        return jsonify({'success': False, 'error': 'light_id is required'}), 400
+    if nanoleaf_client is None:
+        return jsonify({'success': False, 'error': 'Nanoleaf client not initialized'}), 400
+    device = nanoleaf_client.get_device(requested_id)
+    if device is None:
+        return jsonify({'success': False, 'error': 'Light not found'}), 404
+    if not device.paired:
+        return jsonify({'success': False, 'error': 'Pair this Nanoleaf before identifying it'}), 400
+    try:
+        nanoleaf_client.identify(device)
+    except NanoleafError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    return jsonify({'success': True, 'light_label': device.label})
 
 
 @app.route('/api/lights/manual', methods=['POST'])
@@ -1558,6 +2400,7 @@ def add_manual_light():
     
     # Try to probe the light to get its target MAC address
     light = None
+    nanoleaf_device = None
     if lifx_client:
         try:
             light = lifx_client.probe_light_by_ip(ip, timeout=3.0)
@@ -1568,15 +2411,34 @@ def add_manual_light():
                 time.sleep(0.5)  # Wait for responses
         except Exception as e:
             print(f"Error probing light at {ip}: {e}")
+    if light is None:
+        try:
+            nl_client = _ensure_nanoleaf_client()
+            token = None
+            for record in nanoleaf_auth.values():
+                if record.get('ip') == ip and record.get('auth_token'):
+                    token = record['auth_token']
+                    break
+            nanoleaf_device = nl_client.probe_by_ip(ip, auth_token=token)
+            if nanoleaf_device is not None:
+                nl_client.ensure_layout(nanoleaf_device)
+        except Exception as e:
+            print(f"Error probing Nanoleaf at {ip}: {e}")
     
     # Generate light_id
     if light and light.target:
         # Use the actual target MAC address
         lid = light.target.hex()
         light_label = light.label or label or f"Light {ip}"
-        light_model = light.model_name or 'Unknown Model'
+        light_model = _display_model(light)
         zone_fields = _light_zone_fields(light)
         supported_modes = _supported_modes_for(light)
+    elif nanoleaf_device is not None:
+        lid = nanoleaf_device.id
+        light_label = nanoleaf_device.label or label or f"Nanoleaf {ip}"
+        light_model = _display_model(nanoleaf_device)
+        zone_fields = _light_zone_fields(nanoleaf_device)
+        supported_modes = _supported_modes_for(nanoleaf_device)
     else:
         # Create a placeholder ID based on IP (will be updated when discovered)
         # Use a hash of the IP to create a consistent ID
@@ -1601,6 +2463,12 @@ def add_manual_light():
         'universe': None,  # User needs to configure this
         'start_channel': None  # User needs to configure this
     }
+    if nanoleaf_device is not None:
+        mapping['vendor'] = 'nanoleaf'
+        mapping['port'] = nanoleaf_device.port
+        mapping['panel_ids'] = list(nanoleaf_device.panel_ids)
+        if nanoleaf_device.auth_token:
+            _store_nanoleaf_auth(nanoleaf_device)
     if zone_fields is not None:
         mapping.update({
             'zone_capable': zone_fields['zone_capable'],
@@ -1626,8 +2494,10 @@ def add_manual_light():
             'label': light_label,
             'ip': ip,
             'model': light_model,
+            'vendor': mapping.get('vendor', 'lifx'),
+            'paired': bool(nanoleaf_auth.get(lid, {}).get('auth_token')) if mapping.get('vendor') == 'nanoleaf' else True,
             'supported_modes': supported_modes,
-            'discovered': light is not None
+            'discovered': light is not None or nanoleaf_device is not None
         }
     })
 
@@ -1637,11 +2507,18 @@ def start_dmx():
     """Start DMX processing"""
     global running, dmx_receiver, dmx_thread, lifx_client, dmx_lock
     
+    _hydrate_lifx_devices()
+
     with dmx_lock:
         if running:
             return jsonify({'success': False, 'error': 'Already running'}), 400
+        if nanoleaf_auth or any(_mapping_vendor(lid, mapping) == 'nanoleaf' for lid, mapping in light_mappings.items()):
+            _ensure_nanoleaf_client()
+            _hydrate_nanoleaf_devices()
         
-        if not lifx_client:
+        has_lifx = lifx_client is not None
+        has_nanoleaf = nanoleaf_client is not None and bool(nanoleaf_client.paired_devices())
+        if not has_lifx and not has_nanoleaf and not light_mappings:
             return jsonify({'success': False, 'error': 'No lights discovered'}), 400
     
     try:
@@ -1664,6 +2541,8 @@ def start_dmx():
             dmx_thread.start()
         
         _start_lifx_batch_sender_thread()
+        if nanoleaf_client and nanoleaf_client.paired_devices():
+            _start_nl_batch_sender_thread()
         
         return jsonify({'success': True})
     except Exception as e:
@@ -1681,6 +2560,7 @@ def stop_dmx():
         running = False
     
     _stop_lifx_batch_sender_thread()
+    _stop_nl_batch_sender_thread()
     
     if dmx_receiver:
         dmx_receiver.stop()
@@ -1718,12 +2598,13 @@ def get_status():
                     discovered_count = len(lifx_client.lights)
                 finally:
                     lifx_client.lock.release()
-            else:
-                # Lock is held, use cached value or skip
-                discovered_count = 0  # Will be updated on next successful call
         except Exception:
-            # If anything fails, just return 0
             discovered_count = 0
+    if nanoleaf_client:
+        try:
+            discovered_count += len(nanoleaf_client.get_devices())
+        except Exception:
+            pass
     
     # Get mappings count safely
     try:
@@ -1759,16 +2640,23 @@ def get_status():
     })
 
 
-def _light_from_id(requested_light_id: str) -> Optional[LifxLight]:
+def _light_from_id(requested_light_id: str) -> Optional[MappedDevice]:
+    mapping = light_mappings.get(requested_light_id)
+    if _mapping_vendor(requested_light_id, mapping) == 'nanoleaf':
+        nl_client = _ensure_nanoleaf_client()
+        device = nl_client.get_device(requested_light_id)
+        if device is not None:
+            nl_client.ensure_layout(device)
+            return device
+        return None
+    found = _find_mapped_device(requested_light_id, mapping)
+    if found is not None:
+        return found
     if not lifx_client:
         return None
     for candidate in lifx_client.get_lights():
         if light_id(candidate) == requested_light_id:
             return candidate
-    with lifx_client.lock:
-        for candidate in lifx_client.lights.values():
-            if light_id(candidate) == requested_light_id:
-                return candidate
     return None
 
 
@@ -1777,8 +2665,8 @@ def test_rgb():
     """Test RGB values directly on a light (DMX-less testing)"""
     global lifx_client
     
-    if not lifx_client:
-        return jsonify({'success': False, 'error': 'LIFX client not initialized'}), 400
+    if not lifx_client and not nanoleaf_client:
+        return jsonify({'success': False, 'error': 'No lighting client initialized'}), 400
     
     data = request.get_json()
     if not data:
@@ -1817,18 +2705,17 @@ def test_rgb():
     light_label = light.label
     
     try:
+        vendor = _device_vendor(light, light_mappings.get(requested_light_id), requested_light_id)
+        kind = 'nl_color' if vendor == 'nanoleaf' else 'color'
         cmd = (
-            'color',
+            kind,
             light,
             r_norm, g_norm, b_norm,
             DEFAULT_KELVIN,
             fade_ms,
             brightness,
         )
-        with _batch_lock:
-            _batch_commands_by_id[light_id(light)] = cmd
-        _start_lifx_batch_sender_thread()
-        _batch_sender_wake.set()
+        _enqueue_device_command(cmd)
     except Exception as submit_error:
         print(f"Error submitting set_rgb: {submit_error}")
         return jsonify({
@@ -1849,8 +2736,8 @@ def test_pixels():
     """Send a per-pixel test pattern to a SuperColour / matrix / strip fixture."""
     global lifx_client
 
-    if not lifx_client:
-        return jsonify({'success': False, 'error': 'LIFX client not initialized'}), 400
+    if not lifx_client and not nanoleaf_client:
+        return jsonify({'success': False, 'error': 'No lighting client initialized'}), 400
 
     data = request.get_json()
     if not data:
@@ -1905,14 +2792,21 @@ def test_pixels():
         return jsonify({'success': False, 'error': f'Unknown pixel test pattern: {pattern}'}), 400
 
     try:
-        future = lifx_client.executor.submit(
-            lifx_client.send_zones_now,
-            light.target,
-            light.ip,
-            cmds,
-            fade_ms,
-        )
-        future.result(timeout=2.0)
+        if _device_vendor(light, light_mappings.get(requested_light_id), requested_light_id) == 'nanoleaf':
+            if nanoleaf_client is None:
+                return jsonify({'success': False, 'error': 'Nanoleaf client not initialized'}), 400
+            nanoleaf_client.send_zones(light, cmds)
+        else:
+            if lifx_client is None:
+                return jsonify({'success': False, 'error': 'LIFX client not initialized'}), 400
+            future = lifx_client.executor.submit(
+                lifx_client.send_zones_now,
+                light.target,
+                light.ip,
+                cmds,
+                fade_ms,
+            )
+            future.result(timeout=2.0)
     except Exception as send_error:
         print(f"Error sending pixel test: {send_error}")
         return jsonify({
@@ -1961,12 +2855,17 @@ def get_metrics():
         # Convert deque objects to lists for JSON serialization
         metrics['frame_times'] = list(metrics['frame_times'])
         metrics['batch_sizes'] = list(metrics['batch_sizes'])
+        nl_metrics = dict(_nl_perf_metrics)
+        nl_metrics['batch_sizes'] = list(_nl_perf_metrics['batch_sizes'])
+        nl_metrics['batch_interval_ms'] = NANOLEAF_BATCH_INTERVAL * 1000
+        metrics['nanoleaf'] = nl_metrics
     
     return jsonify({
         'success': True,
         'metrics': metrics,
         'batch_config': {
             'batch_interval_ms': BATCH_INTERVAL * 1000,
+            'nanoleaf_batch_interval_ms': NANOLEAF_BATCH_INTERVAL * 1000,
             'fade_duration_ms': FADE_DURATION_MS,
             'max_workers': (
                 lifx_client.executor_max_workers
@@ -1981,7 +2880,7 @@ def auto_discover_configured_lights():
     """Automatically discover configured lights by their saved IP addresses"""
     global lifx_client, light_mappings
     
-    if not light_mappings:
+    if not light_mappings and not nanoleaf_auth:
         return
     
     # Initialize LIFX client if needed
@@ -1991,23 +2890,44 @@ def auto_discover_configured_lights():
             lifx_client = LifxLanClient(bind_ip=lifx_bind_ip)
         except OSError as e:
             print(f"Failed to create LIFX client (bind {lifx_bind_ip!r}): {e}")
-            return
+    
+    nl_client = None
+    if any(_mapping_vendor(lid, mapping) == 'nanoleaf' for lid, mapping in light_mappings.items()) or nanoleaf_auth:
+        nl_client = _ensure_nanoleaf_client()
     
     print(f"Auto-discovering {len(light_mappings)} configured light(s)...")
     
     # Probe each configured light by its saved IP
-    for light_id, mapping in light_mappings.items():
+    for mapped_id, mapping in light_mappings.items():
         saved_ip = mapping.get('ip')
-        if saved_ip and saved_ip != 'Not discovered':
-            try:
-                print(f"  Probing {saved_ip} ({mapping.get('label', light_id[:8])})...")
-                discovered_light = lifx_client.probe_light_by_ip(saved_ip, timeout=1.5)
-                if discovered_light:
-                    print(f"    [OK] Found: {discovered_light.label} ({discovered_light.model_name})")
+        if not saved_ip or saved_ip == 'Not discovered':
+            continue
+        try:
+            print(f"  Probing {saved_ip} ({mapping.get('label', mapped_id[:8])})...")
+            if _mapping_vendor(mapped_id, mapping) == 'nanoleaf':
+                if nl_client is None:
+                    print("    [ERROR] Nanoleaf client unavailable")
+                    continue
+                token = mapping.get('auth_token') or nanoleaf_auth.get(mapped_id, {}).get('auth_token')
+                port = int(mapping.get('port') or nanoleaf_auth.get(mapped_id, {}).get('port') or DEFAULT_API_PORT)
+                discovered = nl_client.probe_by_ip(saved_ip, port=port, auth_token=token, timeout=1.5)
+                if discovered and discovered.paired:
+                    print(f"    [OK] Found: {discovered.label} ({discovered.model_name})")
+                elif discovered:
+                    print(f"    [ERROR] Found at {saved_ip} but not paired")
                 else:
                     print(f"    [ERROR] Not found at {saved_ip}")
-            except Exception as e:
-                print(f"    [ERROR] Error probing {saved_ip}: {e}")
+                continue
+            if lifx_client is None:
+                print("    [ERROR] LIFX client unavailable")
+                continue
+            discovered_light = lifx_client.probe_light_by_ip(saved_ip, timeout=1.5)
+            if discovered_light:
+                print(f"    [OK] Found: {discovered_light.label} ({discovered_light.model_name})")
+            else:
+                print(f"    [ERROR] Not found at {saved_ip}")
+        except Exception as e:
+            print(f"    [ERROR] Error probing {saved_ip}: {e}")
     
     print("Auto-discovery complete.")
 
@@ -2028,7 +2948,7 @@ class _ErrorOnlyRequestHandler(WSGIRequestHandler):
 if __name__ == '__main__':
     load_config()
     
-    print(f"sACN2LIFX v{VERSION} Server starting...")
+    print(f"sACN2HomeLX v{VERSION} Server starting (LIFX + Nanoleaf)...")
     
     # Auto-discover configured lights on startup
     auto_discover_configured_lights()

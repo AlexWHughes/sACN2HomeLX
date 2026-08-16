@@ -548,6 +548,50 @@ class TestDiscoveryBroadcast(unittest.TestCase):
         finally:
             client.close()
 
+    @patch('time.sleep')
+    def test_discover_keeps_existing_lights(self, _mock_sleep):
+        client, _mock_sock = self._mock_client()
+        try:
+            existing = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+            existing.label = 'Keep Me'
+            client.lights[existing.target] = existing
+            found = client.discover_lights(timeout=0)
+            self.assertIn(existing.target, client.lights)
+            self.assertTrue(any(light.target == existing.target for light in found))
+        finally:
+            client.close()
+
+    def test_listen_refreshes_known_light_ip(self):
+        client, mock_sock = self._mock_client()
+        try:
+            target = bytes.fromhex('d073d5aabbcc0000')
+            existing = LifxLight(target, '192.168.1.50')
+            existing.label = 'Keep Me'
+            client.lights[target] = existing
+            packet = client._finalise(
+                client._build_header(lifx_client.STATE_SERVICE, target=target, tagged=False)
+            )
+            calls = {'n': 0}
+
+            def recvfrom(_size):
+                if calls['n'] == 0:
+                    calls['n'] += 1
+                    return (packet, ('192.168.1.99', lifx_client.LIFX_PORT))
+                client.listening = False
+                raise socket.timeout
+
+            mock_sock.recvfrom.side_effect = recvfrom
+            client.listening = True
+            client._listen()
+            self.assertIs(client.lights[target], existing)
+            self.assertEqual(existing.ip, '192.168.1.99')
+            client._request_label(existing)
+            dests = [call.args[1] for call in mock_sock.sendto.call_args_list]
+            self.assertIn(('192.168.1.99', lifx_client.LIFX_PORT), dests)
+        finally:
+            client.listening = False
+            client.close()
+
     def test_live_socket_broadcast_does_not_raise_permission_denied(self):
         client = LifxLanClient(bind_ip="0.0.0.0")
         try:
@@ -771,6 +815,32 @@ class TestMultizonePackets(unittest.TestCase):
         apply1 = packets[1][lifx_client.HEADER_SIZE + 14]
         self.assertEqual(apply0, lifx_client.MULTI_ZONE_NO_APPLY)
         self.assertEqual(apply1, lifx_client.MULTI_ZONE_APPLY)
+
+    def test_legacy_linear_truncates_past_8bit_zone_range(self):
+        light = LifxLight(b'\x09' * 8, '192.168.1.16')
+        light.layout = 'linear'
+        light.product = 31
+        colors = [(i, 1, 2, 3500) for i in range(lifx_client.LEGACY_MZ_MAX_ZONES + 10)]
+        packets = self.client._zone_packets_for_light(light, colors, 20)
+        last_start, last_end = packets[-1][lifx_client.HEADER_SIZE:lifx_client.HEADER_SIZE + 2]
+        self.assertLess(last_end, lifx_client.LEGACY_MZ_MAX_ZONES)
+        self.assertEqual(len(packets), lifx_client.LEGACY_MZ_MAX_ZONES)
+
+    def test_legacy_linear_preserves_run_colours(self):
+        light = LifxLight(b'\x09' * 8, '192.168.1.16')
+        light.layout = 'linear'
+        light.product = 31
+        colors = [(i, 1, 2, 3500) for i in range(40)]
+        packets = self.client._zone_packets_for_light(light, colors, 20)
+        self.assertEqual(len(packets), 40)
+        for index, color in enumerate(colors):
+            start, end, hue, sat, bri, kel, _dur, _apply = struct.unpack_from(
+                '<BBHHHHIB',
+                packets[index],
+                lifx_client.HEADER_SIZE,
+            )
+            self.assertEqual((start, end), (index, index))
+            self.assertEqual((hue, sat, bri, kel), color)
 
     def test_extended_linear_still_uses_message_510(self):
         light = LifxLight(b'\x0a' * 8, '192.168.1.17')

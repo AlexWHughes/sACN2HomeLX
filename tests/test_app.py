@@ -233,11 +233,13 @@ class TestRestartDmxIfRunning(unittest.TestCase):
         
         app.sacn_interface = "192.168.1.1"
         
-        # Execute - should not raise exception
+        # Execute - stop() may fail, but teardown must still release resources
         app._restart_dmx_if_running()
         
-        # Verify running flag was set to False due to exception
-        self.assertFalse(app.running)
+        mock_receiver.reset_stats.assert_called()
+        mock_receiver.close.assert_called()
+        mock_dmx_receiver_class.assert_called_once()
+        self.assertTrue(app.running)
     
     @patch('app.DMXReceiver')
     @patch('app.threading.Thread')
@@ -337,6 +339,13 @@ class TestDmxU16Helpers(unittest.TestCase):
 
     def test_fine_first(self):
         self.assertEqual(app._dmx_u16(0x34, 0x12, True), 0x1234)
+
+
+class TestMappingVendor(unittest.TestCase):
+    def test_prefix_and_stored_vendor(self):
+        self.assertEqual(app._mapping_vendor('nl_abc', {}), 'nanoleaf')
+        self.assertEqual(app._mapping_vendor('deadbeef', {'vendor': 'nanoleaf'}), 'nanoleaf')
+        self.assertEqual(app._mapping_vendor('deadbeef', {}), 'lifx')
 
 
 class TestChannelModeSpec(unittest.TestCase):
@@ -456,17 +465,34 @@ class TestListLightsApi(unittest.TestCase):
         self.client = self.flask_app.test_client()
         self._saved_mappings = dict(app.light_mappings)
         self._saved_client = app.lifx_client
+        self._saved_nl = app.nanoleaf_client
+        self._saved_nl_auth = dict(app.nanoleaf_auth)
+        app.nanoleaf_client = None
+        app.nanoleaf_auth = {}
         app._dmx_mapping_cache_dirty = True
+        self._schedule_patch = patch.object(app, '_schedule_nanoleaf_hydrate')
+        self._schedule_patch.start()
+        self._lifx_schedule_patch = patch.object(app, '_schedule_lifx_hydrate')
+        self._lifx_schedule_patch.start()
+        app._lifx_hydrate_in_flight = False
+        app._lifx_probe_next_attempt.clear()
 
     def tearDown(self):
         app.light_mappings = self._saved_mappings
         app.lifx_client = self._saved_client
+        app.nanoleaf_client = self._saved_nl
+        app.nanoleaf_auth = self._saved_nl_auth
         app._dmx_mapping_cache_dirty = True
+        app._lifx_hydrate_in_flight = False
+        app._lifx_probe_next_attempt.clear()
+        self._schedule_patch.stop()
+        self._lifx_schedule_patch.stop()
 
     def test_list_lights_no_client_empty_mappings(self):
         app.light_mappings = {}
         app._dmx_mapping_cache_dirty = True
         app.lifx_client = None
+        app.nanoleaf_client = None
         resp = self.client.get('/api/lights')
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
@@ -559,6 +585,511 @@ class TestListLightsApi(unittest.TestCase):
         pattern_ids = [item['id'] for item in row['pixel_test_patterns']]
         self.assertEqual(pattern_ids[0], 'rainbow')
         self.assertIn('chase', pattern_ids)
+
+    def test_list_lights_includes_unpaired_nanoleaf(self):
+        from nanoleaf_client import NanoleafDevice
+        device = NanoleafDevice('nl_canvas1', '192.168.1.80', label='Living Canvas', model='NL29')
+        device.panel_ids = [1, 2, 3, 4]
+        device.panel_layout = [
+            {'id': 1, 'x': 0, 'y': 100, 'o': 0, 'shapeType': 8},
+            {'id': 2, 'x': 50, 'y': 50, 'o': 60, 'shapeType': 8},
+            {'id': 3, 'x': 0, 'y': 0, 'o': 0, 'shapeType': 8},
+            {'id': 4, 'x': 50, 'y': 0, 'o': 60, 'shapeType': 8},
+        ]
+        device.layout = 'linear'
+        mock_nl = Mock()
+        mock_nl.get_devices.return_value = [device]
+        app.nanoleaf_client = mock_nl
+        app.lifx_client = None
+        app.light_mappings = {}
+        resp = self.client.get('/api/lights')
+        data = resp.get_json()
+        self.assertEqual(len(data['unconfigured_lights']), 1)
+        row = data['unconfigured_lights'][0]
+        self.assertEqual(row['vendor'], 'nanoleaf')
+        self.assertFalse(row['paired'])
+        self.assertTrue(row['zone_capable'])
+        self.assertEqual(len(row['panel_layout']), 4)
+        self.assertIn('RGB Full Pixel (8bit)', row['supported_modes'])
+
+    def test_list_lights_hydrates_nanoleaf_layout_onto_mapping(self):
+        from nanoleaf_client import NanoleafClient, NanoleafDevice
+        device = NanoleafDevice('nl_DB6E588CD6DB', '192.168.1.115', auth_token='tok', label='Shapes 1BD0', model='NL42')
+        mock_nl = Mock(spec=NanoleafClient)
+        mock_nl.get_devices.return_value = [device]
+        mock_nl.get_device.return_value = device
+
+        def _ensure_layout(target):
+            target.panel_ids = [8954, 64823, 24285]
+            target.layout = 'linear'
+            target.matrix_width = 3
+            target.matrix_height = 1
+            return target
+
+        mock_nl.ensure_layout.side_effect = _ensure_layout
+        mock_nl.requested_bind_ip = app._normalize_interface_ip(app.lifx_interface)
+        app.nanoleaf_client = mock_nl
+        app.nanoleaf_auth = {'nl_DB6E588CD6DB': {'auth_token': 'tok', 'ip': '192.168.1.115', 'port': 16021}}
+        app.light_mappings = {
+            'nl_DB6E588CD6DB': {
+                'universe': 1,
+                'start_channel': 1,
+                'brightness': 1.0,
+                'channel_mode': 'RGB (8bit)',
+                'label': 'Light 192.168.1.115',
+                'model': 'Nanoleaf',
+                'ip': '192.168.1.115',
+                'vendor': 'nanoleaf',
+                'zone_capable': False,
+                'zone_count': 1,
+                'zone_layout': 'single',
+                'panel_ids': [],
+            }
+        }
+        with patch.object(app, 'save_config'):
+            app._hydrate_nanoleaf_devices()
+            resp = self.client.get('/api/lights')
+        row = resp.get_json()['all_configured_lights'][0]
+        self.assertTrue(row['zone_capable'])
+        self.assertEqual(row['zone_count'], 3)
+        self.assertIn('RGB Full Pixel (8bit)', row['supported_modes'])
+        self.assertEqual(app.light_mappings['nl_DB6E588CD6DB']['label'], 'Shapes 1BD0')
+        self.assertEqual(row['model'], 'Shapes')
+        self.assertEqual(app.light_mappings['nl_DB6E588CD6DB']['model'], 'Shapes')
+        self.assertNotIn('auth_token', row['mapping'])
+
+    def test_list_lights_hydrates_nanoleaf_model_when_layout_already_known(self):
+        from nanoleaf_client import NanoleafDevice
+        device = NanoleafDevice('nl_DB6E588CD6DB', '192.168.1.115', auth_token='tok', label='', model='')
+        device.panel_ids = [8954, 64823, 24285]
+        device.panel_layout = [
+            {'id': 8954, 'x': 0, 'y': 0},
+            {'id': 64823, 'x': 100, 'y': 0},
+            {'id': 24285, 'x': 200, 'y': 0},
+        ]
+        device.layout = 'linear'
+        mock_nl = Mock()
+        mock_nl.get_devices.return_value = [device]
+        mock_nl.get_device.return_value = device
+
+        def _ensure_layout(target):
+            target.model = 'NL42'
+            target.label = 'Shapes 1BD0'
+            return target
+
+        mock_nl.ensure_layout.side_effect = _ensure_layout
+        mock_nl.requested_bind_ip = app._normalize_interface_ip(app.lifx_interface)
+        app.nanoleaf_client = mock_nl
+        app.nanoleaf_auth = {'nl_DB6E588CD6DB': {'auth_token': 'tok', 'ip': '192.168.1.115', 'port': 16021}}
+        app.light_mappings = {
+            'nl_DB6E588CD6DB': {
+                'universe': 1,
+                'start_channel': 1,
+                'brightness': 1.0,
+                'channel_mode': 'RGB (8bit)',
+                'label': 'Light 192.168.1.115',
+                'model': 'Nanoleaf',
+                'ip': '192.168.1.115',
+                'vendor': 'nanoleaf',
+                'zone_capable': True,
+                'zone_count': 3,
+                'zone_layout': 'linear',
+                'panel_ids': [8954, 64823, 24285],
+                'panel_layout': list(device.panel_layout),
+            }
+        }
+        with patch.object(app, 'save_config'):
+            app._hydrate_nanoleaf_devices()
+            resp = self.client.get('/api/lights')
+        mock_nl.ensure_layout.assert_called()
+        row = resp.get_json()['all_configured_lights'][0]
+        self.assertEqual(row['model'], 'Shapes')
+        self.assertEqual(app.light_mappings['nl_DB6E588CD6DB']['model'], 'Shapes')
+        self.assertEqual(app.light_mappings['nl_DB6E588CD6DB']['label'], 'Shapes 1BD0')
+
+    def test_list_lights_keeps_custom_nanoleaf_panel_order(self):
+        from nanoleaf_client import NanoleafDevice
+        device = NanoleafDevice('nl_DB6E588CD6DB', '192.168.1.115', auth_token='tok', label='Shapes 1BD0', model='NL42')
+        mock_nl = Mock()
+        mock_nl.get_devices.return_value = [device]
+        mock_nl.get_device.return_value = device
+
+        def _ensure_layout(target):
+            target.panel_ids = [8954, 64823, 24285]
+            target.panel_layout = [
+                {'id': 8954, 'x': 0, 'y': 100},
+                {'id': 64823, 'x': 50, 'y': 50},
+                {'id': 24285, 'x': 0, 'y': 0},
+            ]
+            target.layout = 'linear'
+            return target
+
+        mock_nl.ensure_layout.side_effect = _ensure_layout
+        mock_nl.requested_bind_ip = app._normalize_interface_ip(app.lifx_interface)
+        app.nanoleaf_client = mock_nl
+        app.nanoleaf_auth = {'nl_DB6E588CD6DB': {'auth_token': 'tok', 'ip': '192.168.1.115', 'port': 16021}}
+        custom_order = [24285, 8954, 64823]
+        app.light_mappings = {
+            'nl_DB6E588CD6DB': {
+                'universe': 1,
+                'start_channel': 1,
+                'brightness': 1.0,
+                'channel_mode': 'RGB Full Pixel (8bit)',
+                'label': 'Shapes 1BD0',
+                'model': 'Shapes',
+                'ip': '192.168.1.115',
+                'vendor': 'nanoleaf',
+                'panel_ids': custom_order,
+                'map_rotation': 90,
+            }
+        }
+        with patch.object(app, 'save_config'):
+            app._hydrate_nanoleaf_devices()
+            resp = self.client.get('/api/lights')
+        row = resp.get_json()['all_configured_lights'][0]
+        self.assertEqual(row['panel_ids'], custom_order)
+        self.assertEqual(row['map_rotation'], 90)
+        self.assertEqual(device.panel_ids, custom_order)
+        self.assertEqual(device.map_rotation, 90)
+        self.assertEqual(app.light_mappings['nl_DB6E588CD6DB']['panel_ids'], custom_order)
+
+    def test_display_model_skips_repeated_vendor_brand(self):
+        from nanoleaf_client import NanoleafDevice
+        device = NanoleafDevice('nl_x', '192.168.1.115', model='')
+        self.assertEqual(app._display_model(device, {'model': 'Nanoleaf'}), 'Unknown model')
+        device.model = 'NL42'
+        self.assertEqual(app._display_model(device, {'model': 'Nanoleaf'}), 'Shapes')
+        self.assertEqual(app._display_model(None, {'model': 'Nanoleaf'}), 'Unknown model')
+
+    def test_import_nanoleaf_tokens_strips_mapping_auth_token(self):
+        app.light_mappings = {
+            'nl_legacy': {
+                'vendor': 'nanoleaf',
+                'auth_token': 'legacy-token',
+                'ip': '10.0.0.8',
+                'port': 16021,
+            }
+        }
+        app.nanoleaf_auth = {
+            'nl_legacy': {
+                'auth_token': 'should-be-replaced',
+                'ip': '10.0.0.9',
+                'port': 16022,
+            }
+        }
+        app._import_nanoleaf_tokens_from_mappings()
+        self.assertNotIn('auth_token', app.light_mappings['nl_legacy'])
+        self.assertEqual(app.nanoleaf_auth['nl_legacy']['auth_token'], 'legacy-token')
+        self.assertEqual(app.nanoleaf_auth['nl_legacy']['ip'], '10.0.0.8')
+        self.assertEqual(app.nanoleaf_auth['nl_legacy']['port'], 16021)
+
+    def test_import_nanoleaf_tokens_keeps_existing_ip_port_fallback(self):
+        app.light_mappings = {
+            'nl_legacy': {
+                'vendor': 'nanoleaf',
+                'auth_token': 'legacy-token',
+            }
+        }
+        app.nanoleaf_auth = {
+            'nl_legacy': {
+                'auth_token': 'old',
+                'ip': '10.0.0.9',
+                'port': 16022,
+            }
+        }
+        app._import_nanoleaf_tokens_from_mappings()
+        self.assertNotIn('auth_token', app.light_mappings['nl_legacy'])
+        self.assertEqual(app.nanoleaf_auth['nl_legacy']['ip'], '10.0.0.9')
+        self.assertEqual(app.nanoleaf_auth['nl_legacy']['port'], 16022)
+
+    def test_pair_nanoleaf_saves_token(self):
+        from nanoleaf_client import NanoleafDevice
+        device = NanoleafDevice('nl_canvas1', '192.168.1.80', label='Living Canvas', model='NL29')
+        mock_nl = Mock()
+        mock_nl.get_device.return_value = device
+
+        def _pair(target):
+            target.auth_token = 'secret-token'
+            target.panel_ids = [1, 2]
+            target.layout = 'linear'
+
+        mock_nl.pair.side_effect = _pair
+        app.nanoleaf_auth = {}
+        app.light_mappings = {
+            'nl_canvas1': {
+                'universe': 1,
+                'start_channel': 1,
+                'channel_mode': 'RGB (8bit)',
+                'vendor': 'nanoleaf',
+                'auth_token': 'legacy-on-mapping',
+                'ip': '192.168.1.80',
+            }
+        }
+        saved = {}
+
+        def _save():
+            saved.update(app.nanoleaf_auth)
+
+        with patch.object(app, '_ensure_nanoleaf_client', return_value=mock_nl), \
+             patch.object(app, 'save_config', side_effect=_save):
+            resp = self.client.post('/api/nanoleaf/pair', json={'light_id': 'nl_canvas1'})
+        data = resp.get_json()
+        self.assertTrue(data['success'], data)
+        self.assertTrue(data['light']['paired'])
+        self.assertEqual(saved['nl_canvas1']['auth_token'], 'secret-token')
+        self.assertNotIn('auth_token', app.light_mappings['nl_canvas1'])
+
+    def test_pair_nanoleaf_rejects_invalid_port(self):
+        mock_nl = Mock()
+        mock_nl.get_device.return_value = None
+        with patch.object(app, '_ensure_nanoleaf_client', return_value=mock_nl):
+            resp = self.client.post(
+                '/api/nanoleaf/pair',
+                json={'ip': '192.168.1.80', 'port': 'abc'},
+            )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()['success'])
+        mock_nl.probe_by_ip.assert_not_called()
+
+    def test_pair_nanoleaf_rejects_out_of_range_port(self):
+        mock_nl = Mock()
+        mock_nl.get_device.return_value = None
+        with patch.object(app, '_ensure_nanoleaf_client', return_value=mock_nl):
+            for port in (0, 65536):
+                resp = self.client.post(
+                    '/api/nanoleaf/pair',
+                    json={'ip': '192.168.1.80', 'port': port},
+                )
+                self.assertEqual(resp.status_code, 400, port)
+                self.assertFalse(resp.get_json()['success'])
+        mock_nl.probe_by_ip.assert_not_called()
+
+    def test_update_panel_addressing_rotates_and_reorders(self):
+        from nanoleaf_client import NanoleafDevice
+        device = NanoleafDevice('nl_shapes', '192.168.1.115', auth_token='tok', label='Shapes', model='NL42')
+        device.panel_layout = [
+            {'id': 1, 'x': 0, 'y': 100},
+            {'id': 3, 'x': 100, 'y': 100},
+            {'id': 4, 'x': 0, 'y': 0},
+            {'id': 2, 'x': 100, 'y': 0},
+        ]
+        device.panel_ids = [1, 3, 4, 2]
+        mock_nl = Mock()
+        mock_nl.get_device.return_value = device
+        app.nanoleaf_client = mock_nl
+        app.light_mappings = {
+            'nl_shapes': {
+                'universe': 1,
+                'start_channel': 1,
+                'channel_mode': 'RGB Full Pixel (8bit)',
+                'vendor': 'nanoleaf',
+                'panel_ids': [1, 3, 4, 2],
+                'panel_layout': list(device.panel_layout),
+                'map_rotation': 0,
+            }
+        }
+        with patch.object(app, 'save_config'):
+            rotated = self.client.post('/api/lights/addressing', json={
+                'light_id': 'nl_shapes',
+                'map_rotation': 90,
+            })
+        self.assertTrue(rotated.get_json()['success'], rotated.get_json())
+        self.assertEqual(rotated.get_json()['map_rotation'], 90)
+        self.assertEqual(device.map_rotation, 90)
+        self.assertEqual(device.panel_ids, [1, 3, 4, 2])
+        with patch.object(app, 'save_config'):
+            reset = self.client.post('/api/lights/addressing', json={
+                'light_id': 'nl_shapes',
+                'map_rotation': 90,
+                'reset_order': True,
+            })
+        self.assertEqual(reset.get_json()['panel_ids'], [4, 1, 2, 3])
+        self.assertEqual(device.panel_ids, [4, 1, 2, 3])
+        with patch.object(app, 'save_config'):
+            custom = self.client.post('/api/lights/addressing', json={
+                'light_id': 'nl_shapes',
+                'panel_ids': [2, 1, 4, 3],
+            })
+        self.assertEqual(custom.get_json()['panel_ids'], [2, 1, 4, 3])
+        self.assertEqual(app.light_mappings['nl_shapes']['panel_ids'], [2, 1, 4, 3])
+
+    def test_update_panel_addressing_rejects_non_numeric_layout_ids(self):
+        app.nanoleaf_client = Mock()
+        app.nanoleaf_client.get_device.return_value = None
+        app.light_mappings = {
+            'nl_shapes': {
+                'universe': 1,
+                'start_channel': 1,
+                'channel_mode': 'RGB Full Pixel (8bit)',
+                'vendor': 'nanoleaf',
+                'panel_layout': [{'id': 'abc', 'x': 0, 'y': 0}, {'id': 2, 'x': 1, 'y': 0}],
+            }
+        }
+        resp = self.client.post('/api/lights/addressing', json={
+            'light_id': 'nl_shapes',
+            'reset_order': True,
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()['success'])
+        self.assertIn('non-numeric', resp.get_json()['error'])
+
+    def test_list_lights_keeps_lifx_online_when_nanoleaf_is_present(self):
+        from lifx_client import LifxLight
+        from nanoleaf_client import NanoleafDevice
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+        light.label = 'Stage Wash'
+        light.model_name = 'LIFX Color'
+        lid = app.light_id(light)
+        device = NanoleafDevice('nl_shapes', '192.168.1.115', auth_token='tok', label='Shapes', model='NL42')
+        mock_client = Mock()
+        mock_client.get_lights.return_value = [light]
+        mock_client.lights = {light.target: light}
+        mock_client.lock = threading.Lock()
+        mock_nl = Mock()
+        mock_nl.get_devices.return_value = [device]
+        mock_nl.get_device.return_value = device
+        mock_nl.requested_bind_ip = app._normalize_interface_ip(app.lifx_interface)
+        app.lifx_client = mock_client
+        app.nanoleaf_client = mock_nl
+        app.nanoleaf_auth = {'nl_shapes': {'auth_token': 'tok', 'ip': '192.168.1.115', 'port': 16021}}
+        app.light_mappings = {
+            lid: {
+                'universe': 1,
+                'start_channel': 1,
+                'brightness': 1.0,
+                'channel_mode': 'RGB (8bit)',
+                'label': 'Stage Wash',
+                'model': 'LIFX Color',
+                'ip': '192.168.1.50',
+            },
+            'nl_shapes': {
+                'universe': 1,
+                'start_channel': 10,
+                'brightness': 1.0,
+                'channel_mode': 'RGB (8bit)',
+                'label': 'Shapes',
+                'vendor': 'nanoleaf',
+                'ip': '192.168.1.115',
+            },
+        }
+        with patch.object(app, 'save_config'):
+            resp = self.client.get('/api/lights')
+        rows = {row['id']: row for row in resp.get_json()['all_configured_lights']}
+        self.assertTrue(rows[lid]['discovered'])
+        self.assertTrue(rows['nl_shapes']['discovered'])
+
+    def test_list_lights_matches_lifx_by_saved_ip(self):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+        light.label = 'Stage Wash'
+        mock_client = Mock()
+        mock_client.get_lights.return_value = [light]
+        mock_client.lights = {light.target: light}
+        mock_client.lock = threading.Lock()
+        app.lifx_client = mock_client
+        app.light_mappings = {
+            'stale-mapping-id': {
+                'universe': 1,
+                'start_channel': 1,
+                'brightness': 1.0,
+                'channel_mode': 'RGB (8bit)',
+                'label': 'Stage Wash',
+                'ip': '192.168.1.50',
+            }
+        }
+        resp = self.client.get('/api/lights')
+        self.assertTrue(resp.get_json()['all_configured_lights'][0]['discovered'])
+
+    def test_list_lights_reprobes_missing_mapped_lifx(self):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+        lid = app.light_id(light)
+        mock_client = Mock()
+        mock_client.get_lights.return_value = []
+        mock_client.lights = {}
+        mock_client.lock = threading.Lock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _probe(ip, timeout=0.6):
+            entered.set()
+            if not release.wait(timeout=2):
+                return None
+            mock_client.lights[light.target] = light
+            return light
+
+        mock_client.probe_light_by_ip.side_effect = _probe
+        app.lifx_client = mock_client
+        app.light_mappings = {
+            lid: {
+                'universe': 1,
+                'start_channel': 1,
+                'brightness': 1.0,
+                'channel_mode': 'RGB (8bit)',
+                'label': 'Stage Wash',
+                'ip': '192.168.1.50',
+            }
+        }
+        self._lifx_schedule_patch.stop()
+        try:
+            started = time.monotonic()
+            resp = self.client.get('/api/lights')
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertFalse(resp.get_json()['all_configured_lights'][0]['discovered'])
+            self.assertTrue(entered.wait(timeout=2))
+            mock_client.probe_light_by_ip.assert_called()
+        finally:
+            release.set()
+            self._lifx_schedule_patch.start()
+
+    def test_hydrate_lifx_probes_missing_mapped_lights(self):
+        from lifx_client import LifxLight
+        light = LifxLight(bytes.fromhex('d073d5aabbcc0000'), '192.168.1.50')
+        lid = app.light_id(light)
+        mock_client = Mock()
+        mock_client.lights = {}
+        mock_client.lock = threading.Lock()
+
+        def _probe(ip, timeout=0.6):
+            mock_client.lights[light.target] = light
+            return light
+
+        mock_client.probe_light_by_ip.side_effect = _probe
+        app.lifx_client = mock_client
+        app.light_mappings = {
+            lid: {
+                'universe': 1,
+                'start_channel': 1,
+                'brightness': 1.0,
+                'channel_mode': 'RGB (8bit)',
+                'label': 'Stage Wash',
+                'ip': '192.168.1.50',
+            }
+        }
+        app._hydrate_lifx_devices()
+        mock_client.probe_light_by_ip.assert_called_once_with('192.168.1.50', timeout=0.6)
+        app._hydrate_lifx_devices()
+        mock_client.probe_light_by_ip.assert_called_once()
+
+    def test_hydrate_lifx_respects_probe_backoff(self):
+        mock_client = Mock()
+        mock_client.lights = {}
+        mock_client.lock = threading.Lock()
+        mock_client.probe_light_by_ip.return_value = None
+        app.lifx_client = mock_client
+        app.light_mappings = {
+            'd073d5aabbcc': {
+                'universe': 1,
+                'start_channel': 1,
+                'brightness': 1.0,
+                'channel_mode': 'RGB (8bit)',
+                'label': 'Stage Wash',
+                'ip': '192.168.1.50',
+            }
+        }
+        app._hydrate_lifx_devices()
+        app._hydrate_lifx_devices()
+        mock_client.probe_light_by_ip.assert_called_once()
 
 
 class TestGetNetworkInterfaces(unittest.TestCase):
@@ -854,6 +1385,8 @@ class TestTestRgbApi(unittest.TestCase):
         self.flask_app.config['TESTING'] = True
         self.client = self.flask_app.test_client()
         self._saved_client = app.lifx_client
+        self._saved_nl = app.nanoleaf_client
+        app.nanoleaf_client = None
         with app._batch_lock:
             self._saved_batch = dict(app._batch_commands_by_id)
             app._batch_commands_by_id.clear()
@@ -861,6 +1394,7 @@ class TestTestRgbApi(unittest.TestCase):
     def tearDown(self):
         app._stop_lifx_batch_sender_thread()
         app.lifx_client = self._saved_client
+        app.nanoleaf_client = self._saved_nl
         with app._batch_lock:
             app._batch_commands_by_id.clear()
             app._batch_commands_by_id.update(self._saved_batch)
@@ -1153,7 +1687,9 @@ class TestMetricsUtilization(unittest.TestCase):
 class TestBatchDrainDuration(unittest.TestCase):
     def setUp(self):
         self._saved_client = app.lifx_client
+        self._saved_nl_client = app.nanoleaf_client
         self._last_batch = app._last_batch_time
+        self._nl_last_batch = app._nl_last_batch_time
         with app._perf_lock:
             self._overrun = app._perf_metrics['drain_overrun_count']
             self._last_drain = app._perf_metrics['last_drain_duration_s']
@@ -1162,13 +1698,25 @@ class TestBatchDrainDuration(unittest.TestCase):
             self._commands_sent = app._perf_metrics['total_commands_sent']
             self._batch_sizes = list(app._perf_metrics['batch_sizes'])
             self._avg = app._perf_metrics['avg_batch_size']
+            self._nl_overrun = app._nl_perf_metrics['drain_overrun_count']
+            self._nl_last_drain = app._nl_perf_metrics['last_drain_duration_s']
+            self._nl_peak = app._nl_perf_metrics['peak_drain_duration_s']
+            self._nl_batches_sent = app._nl_perf_metrics['total_batches_sent']
+            self._nl_commands_sent = app._nl_perf_metrics['total_commands_sent']
+            self._nl_batch_sizes = list(app._nl_perf_metrics['batch_sizes'])
+            self._nl_avg = app._nl_perf_metrics['avg_batch_size']
         with app._batch_lock:
             self._saved_batch = dict(app._batch_commands_by_id)
             app._batch_commands_by_id.clear()
+        with app._nl_batch_lock:
+            self._saved_nl_batch = dict(app._nl_batch_commands_by_id)
+            app._nl_batch_commands_by_id.clear()
 
     def tearDown(self):
         app.lifx_client = self._saved_client
+        app.nanoleaf_client = self._saved_nl_client
         app._last_batch_time = self._last_batch
+        app._nl_last_batch_time = self._nl_last_batch
         with app._perf_lock:
             app._perf_metrics['drain_overrun_count'] = self._overrun
             app._perf_metrics['last_drain_duration_s'] = self._last_drain
@@ -1178,9 +1726,20 @@ class TestBatchDrainDuration(unittest.TestCase):
             app._perf_metrics['avg_batch_size'] = self._avg
             app._perf_metrics['batch_sizes'].clear()
             app._perf_metrics['batch_sizes'].extend(self._batch_sizes)
+            app._nl_perf_metrics['drain_overrun_count'] = self._nl_overrun
+            app._nl_perf_metrics['last_drain_duration_s'] = self._nl_last_drain
+            app._nl_perf_metrics['peak_drain_duration_s'] = self._nl_peak
+            app._nl_perf_metrics['total_batches_sent'] = self._nl_batches_sent
+            app._nl_perf_metrics['total_commands_sent'] = self._nl_commands_sent
+            app._nl_perf_metrics['avg_batch_size'] = self._nl_avg
+            app._nl_perf_metrics['batch_sizes'].clear()
+            app._nl_perf_metrics['batch_sizes'].extend(self._nl_batch_sizes)
         with app._batch_lock:
             app._batch_commands_by_id.clear()
             app._batch_commands_by_id.update(self._saved_batch)
+        with app._nl_batch_lock:
+            app._nl_batch_commands_by_id.clear()
+            app._nl_batch_commands_by_id.update(self._saved_nl_batch)
 
     def test_records_drain_duration_when_send_exceeds_interval(self):
         clock = {'t': 1000.0}
@@ -1206,6 +1765,35 @@ class TestBatchDrainDuration(unittest.TestCase):
             app._perf_metrics['last_drain_duration_s'],
         )
         self.assertEqual(app._perf_metrics['drain_overrun_count'], self._overrun + 1)
+
+    def test_nl_records_drain_duration_when_send_exceeds_interval(self):
+        clock = {'t': 1000.0}
+        device = SimpleNamespace(label='Shapes', ip='192.168.1.115')
+        mock_client = Mock()
+
+        def send(*_args, **_kwargs):
+            clock['t'] += app.NANOLEAF_BATCH_INTERVAL + 0.05
+
+        mock_client.send_color.side_effect = send
+        app.nanoleaf_client = mock_client
+        app._nl_last_batch_time = 0
+        with app._nl_batch_lock:
+            app._nl_batch_commands_by_id['nl_x'] = (
+                'nl_color', device, 1.0, 0.0, 0.0, 3500, 45, 1.0,
+            )
+        with patch('app.time.time', side_effect=lambda: clock['t']):
+            app._nl_send_one_batch()
+        mock_client.send_color.assert_called_once()
+        self.assertAlmostEqual(
+            app._nl_perf_metrics['last_drain_duration_s'],
+            app.NANOLEAF_BATCH_INTERVAL + 0.05,
+        )
+        self.assertGreaterEqual(
+            app._nl_perf_metrics['peak_drain_duration_s'],
+            app._nl_perf_metrics['last_drain_duration_s'],
+        )
+        self.assertEqual(app._nl_perf_metrics['drain_overrun_count'], self._nl_overrun + 1)
+        self.assertEqual(app._perf_metrics['drain_overrun_count'], self._overrun)
 
 
 if __name__ == '__main__':

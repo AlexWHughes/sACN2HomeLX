@@ -61,6 +61,8 @@ MULTI_ZONE_NO_APPLY = 0
 EXTENDED_MZ_COLORS_PER_PACKET = 82
 SET64_COLORS_PER_PACKET = 64
 TILE_DEVICE_SIZE = 55
+LEGACY_MZ_MAX_ZONES = 256
+LEGACY_MZ_PACKET_BUDGET = 16
 
 # Canonical DMX channel-mode names (shared with app.py CHANNEL_MODE_SPEC).
 CHANNEL_MODES: Tuple[str, ...] = (
@@ -402,7 +404,9 @@ class LifxLanClient:
             if light is None:
                 return
             packets = self._zone_packets_for_light(light, hsbk, duration_ms)
-        for packet in packets:
+        for index, packet in enumerate(packets):
+            if index > 0 and index % LEGACY_MZ_PACKET_BUDGET == 0:
+                self._rate_limit()
             self._send_command_raw(packet, ip)
         if hsbk:
             hue, sat, bri, kel = hsbk[0]
@@ -482,6 +486,7 @@ class LifxLanClient:
     ) -> List[bytes]:
         """Build SetColorZones (501) packets, one per contiguous colour run."""
         packets = []
+        colors = colors[:LEGACY_MZ_MAX_ZONES]
         if not colors:
             return packets
         runs: List[Tuple[int, int, Tuple[int, int, int, int]]] = []
@@ -695,6 +700,7 @@ class LifxLanClient:
                         self.lights[target] = light
                     else:
                         light = self.lights[target]
+                    light.ip = ip
                     light.last_seen = time.time()
 
                     # Handle different message types
@@ -776,11 +782,11 @@ class LifxLanClient:
     # =========================
 
     def discover_lights(self, timeout: float = 5.0) -> List[LifxLight]:
-        """Discover all LIFX lights on the network"""
-        # Clear existing lights at start of discovery to avoid duplicates
-        with self.lock:
-            self.lights.clear()
-        
+        """Discover all LIFX lights on the network.
+
+        Known lights are kept. A failed or empty scan must not drop bulbs that
+        were already online (for example while Nanoleaf mDNS runs next).
+        """
         # Send broadcast discovery
         header = self._build_header(GET_SERVICE, tagged=True)
         packet = self._finalise(header)

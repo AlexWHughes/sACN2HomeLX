@@ -131,6 +131,7 @@ class TestDMXReceiverRestart(unittest.TestCase):
         sock.stop.side_effect = [OSError('busy'), None]
         with patch.object(dmx_receiver.sacn, 'sACNreceiver', return_value=sock):
             rx = DMXReceiver()
+            self.addCleanup(rx.close)
             with self.assertRaises(OSError):
                 rx.stop()
             self.assertFalse(rx._stopped)
@@ -202,3 +203,28 @@ class TestDMXReceiverMulticast(unittest.TestCase):
                     dmx_receiver.socket.inet_aton('239.255.0.7')
                     + dmx_receiver.socket.inet_aton('192.168.1.50'),
                 )
+
+    def test_missing_multicast_internals_are_warned_and_recorded(self):
+        sock = MagicMock()
+        sock._handler = None
+        with patch.object(dmx_receiver.sacn, 'sACNreceiver', return_value=sock):
+            with patch('builtins.print') as printed:
+                rx = DMXReceiver(bind_ip='192.168.1.50')
+                self.addCleanup(rx.close)
+            self.assertTrue(rx.get_stats()['multicast_internals_missing'])
+            self.assertTrue(
+                any('multicast socket internals' in str(call) for call in printed.call_args_list)
+            )
+
+    def test_ifaddr_missing_warns_once_on_fallback(self):
+        dmx_receiver._ifaddr_missing_warned = False
+        self.addCleanup(setattr, dmx_receiver, '_ifaddr_missing_warned', False)
+        rx = MagicMock()
+        rx.bind_ip = None
+        with patch.object(dmx_receiver, 'ifaddr', None), \
+             patch.object(dmx_receiver, '_local_ipv4_addresses', return_value=[]), \
+             patch('builtins.print') as printed:
+            self.assertEqual(DMXReceiver._membership_ips(rx), ['0.0.0.0'])
+            self.assertEqual(DMXReceiver._membership_ips(rx), ['0.0.0.0'])
+        self.assertEqual(printed.call_count, 1)
+        self.assertIn('ifaddr is not installed', printed.call_args[0][0])
