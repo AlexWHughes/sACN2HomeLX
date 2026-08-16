@@ -5,6 +5,7 @@ from __future__ import annotations
 import colorsys
 import json
 import math
+import os
 import socket
 import struct
 import threading
@@ -26,7 +27,19 @@ DEFAULT_STREAM_PORT = 60222
 DEFAULT_HTTP_TIMEOUT = 3.0
 DISCOVERY_TIMEOUT = 4.0
 MAX_STREAM_HZ = 10
-MIN_STREAM_INTERVAL = 1.0 / MAX_STREAM_HZ
+
+
+def _app_batch_interval_s() -> float:
+    """Match app.NANOLEAF_BATCH_INTERVAL so client throttle stays a safety net."""
+    try:
+        return max(0.05, float(os.getenv('NANOLEAF_BATCH_INTERVAL_MS', '100')) / 1000.0)
+    except ValueError:
+        return 0.1
+
+
+# Strictly below the application batch interval so a pending last frame is sent
+# on the next 10Hz tick instead of remaining stranded.
+MIN_STREAM_INTERVAL = min(1.0 / MAX_STREAM_HZ, _app_batch_interval_s()) * 0.9
 STREAM_TRANSITION_TENTHS = 1  # 100ms; matches the 10Hz stream cap
 
 try:

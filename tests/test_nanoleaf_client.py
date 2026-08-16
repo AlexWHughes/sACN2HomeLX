@@ -248,6 +248,7 @@ class TestSendColorLayout(unittest.TestCase):
         self.assertEqual(sent[-1][0], build_stream_frame(device.stream_version, blue))
         self.assertNotIn(device.id, client._pending_stream)
         self.assertGreater(MIN_STREAM_INTERVAL, 0)
+        self.assertLess(MIN_STREAM_INTERVAL, 1.0 / 10)
 
 
 class TestEnsureLayout(unittest.TestCase):

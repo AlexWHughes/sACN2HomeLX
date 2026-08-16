@@ -3,7 +3,7 @@
 sACN2HomeLX - Control LIFX and Nanoleaf lights via sACN/E1.31
 """
 
-VERSION = "160826 010"
+VERSION = "160826 011"
 
 import json
 import os
@@ -1142,6 +1142,7 @@ _nl_batch_sender_thread: Optional[threading.Thread] = None
 _nl_batch_sender_stop: threading.Event = threading.Event()
 _nl_batch_sender_wake = threading.Event()
 _nl_batch_sender_start_lock = threading.Lock()
+_nl_batch_executor: Optional[ThreadPoolExecutor] = None
 
 # Performance monitoring for multi-fixture setups
 _perf_metrics = {
@@ -1366,14 +1367,13 @@ def _nl_send_one_batch():
 
     drain_start = time.time()
     workers = min(NANOLEAF_BATCH_WORKERS, len(batch))
-    if workers <= 1:
+    if workers <= 1 or _nl_batch_executor is None:
         for item in batch:
             _nl_send_batch_item(item)
     else:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='nl_batch') as pool:
-            futures = [pool.submit(_nl_send_batch_item, item) for item in batch]
-            for future in as_completed(futures):
-                future.result()
+        futures = [_nl_batch_executor.submit(_nl_send_batch_item, item) for item in batch]
+        for future in as_completed(futures):
+            future.result()
 
     _nl_last_batch_time = current_time
     drain_duration = time.time() - drain_start
@@ -1419,11 +1419,16 @@ def _nl_batch_sender_worker(stop_event: threading.Event):
 
 
 def _start_nl_batch_sender_thread():
-    global _nl_batch_sender_thread, _nl_batch_sender_stop, _nl_batch_sender_wake
+    global _nl_batch_sender_thread, _nl_batch_sender_stop, _nl_batch_sender_wake, _nl_batch_executor
 
     with _nl_batch_sender_start_lock:
         if _nl_batch_sender_thread is not None and _nl_batch_sender_thread.is_alive():
             return
+        if _nl_batch_executor is None:
+            _nl_batch_executor = ThreadPoolExecutor(
+                max_workers=NANOLEAF_BATCH_WORKERS,
+                thread_name_prefix='nl_batch',
+            )
         stop_event = threading.Event()
         _nl_batch_sender_stop = stop_event
         _nl_batch_sender_wake.clear()
@@ -1438,11 +1443,15 @@ def _start_nl_batch_sender_thread():
 
 
 def _stop_nl_batch_sender_thread():
-    global _nl_batch_sender_thread
+    global _nl_batch_sender_thread, _nl_batch_executor
 
     with _nl_batch_sender_start_lock:
         t = _nl_batch_sender_thread
+        executor = _nl_batch_executor
+        _nl_batch_executor = None
         if t is None:
+            if executor is not None:
+                executor.shutdown(wait=False)
             return
         with _nl_batch_lock:
             _nl_batch_commands_by_id.clear()
@@ -1450,6 +1459,8 @@ def _stop_nl_batch_sender_thread():
         _nl_batch_sender_wake.set()
         _nl_batch_sender_thread = None
     t.join(timeout=1.0)
+    if executor is not None:
+        executor.shutdown(wait=False)
 
 
 def _ensure_nanoleaf_client() -> NanoleafClient:

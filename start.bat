@@ -1,26 +1,29 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 where py >nul 2>&1
 if %ERRORLEVEL%==0 (
   py -3 launch.py
-  if errorlevel 1 pause
-  exit /b %ERRORLEVEL%
+  set "LAUNCH_EXIT=!ERRORLEVEL!"
+  if !LAUNCH_EXIT! neq 0 pause
+  exit /b !LAUNCH_EXIT!
 )
 
 where python >nul 2>&1
 if %ERRORLEVEL%==0 (
   python launch.py
-  if errorlevel 1 pause
-  exit /b %ERRORLEVEL%
+  set "LAUNCH_EXIT=!ERRORLEVEL!"
+  if !LAUNCH_EXIT! neq 0 pause
+  exit /b !LAUNCH_EXIT!
 )
 
 where python3 >nul 2>&1
 if %ERRORLEVEL%==0 (
   python3 launch.py
-  if errorlevel 1 pause
-  exit /b %ERRORLEVEL%
+  set "LAUNCH_EXIT=!ERRORLEVEL!"
+  if !LAUNCH_EXIT! neq 0 pause
+  exit /b !LAUNCH_EXIT!
 )
 
 echo Python 3.10 or newer is required.
