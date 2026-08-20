@@ -1,5 +1,8 @@
 #!/bin/bash
 cd "$(dirname "$0")"
+# Finder-launched .command windows stay open after the process exits unless we
+# ask Terminal/iTerm to close this tty. launch.py does that on a clean quit.
+export SACN2HOMELX_CLOSE_WINDOW=1
 if command -v python3 >/dev/null 2>&1; then
   exec python3 launch.py
 fi

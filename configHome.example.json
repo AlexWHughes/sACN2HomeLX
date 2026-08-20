@@ -1,0 +1,53 @@
+{
+  "mappings": {
+    "d073d5example0000": {
+      "universe": 1,
+      "start_channel": 1,
+      "brightness": 1.0,
+      "channel_mode": "RGB (8bit)",
+      "label": "Example LIFX",
+      "model": "LIFX Colour A19 1200lm",
+      "ip": "192.168.1.10",
+      "vendor": "lifx",
+      "zone_capable": false,
+      "zone_count": 1,
+      "zone_layout": "single",
+      "matrix_width": 1,
+      "matrix_height": 1
+    },
+    "nl_EXAMPLESERIAL": {
+      "universe": 1,
+      "start_channel": 4,
+      "brightness": 1.0,
+      "channel_mode": "RGB Full Pixel (8bit)",
+      "label": "Example Shapes",
+      "model": "Shapes",
+      "ip": "192.168.1.11",
+      "vendor": "nanoleaf",
+      "zone_capable": true,
+      "zone_count": 2,
+      "zone_layout": "linear",
+      "matrix_width": 2,
+      "matrix_height": 1,
+      "port": 16021,
+      "panel_ids": [1, 2],
+      "panel_layout": [
+        {"id": 1, "x": 0, "y": 0, "o": 0, "shapeType": 8},
+        {"id": 2, "x": 134, "y": 0, "o": 0, "shapeType": 8}
+      ],
+      "map_rotation": 0,
+      "side_length": 134
+    }
+  },
+  "settings": {
+    "lifx_interface": "192.168.1.2",
+    "sacn_interface": "192.168.1.2",
+    "nanoleaf_auth": {
+      "nl_EXAMPLESERIAL": {
+        "auth_token": "YOUR_NANOLEAF_AUTH_TOKEN",
+        "ip": "192.168.1.11",
+        "port": 16021
+      }
+    }
+  }
+}

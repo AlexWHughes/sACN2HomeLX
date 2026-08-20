@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -26,12 +27,114 @@ URL = 'http://127.0.0.1:5001'
 PORT = 5001
 
 
+# Windows STATUS_CONTROL_C_EXIT; Unix 128+SIGINT.
+_CTRL_C_EXIT_CODES = frozenset({130, -2, 0xC000013A, 3221225786})
+
+
+def _should_close_launcher_window() -> bool:
+    """True when start.command / start.bat asked us to close the launcher window."""
+    flag = os.getenv('SACN2HOMELX_CLOSE_WINDOW', '').lower()
+    if flag not in ('1', 'true', 'yes'):
+        return False
+    if os.getenv('SSH_CONNECTION') or os.getenv('SSH_TTY'):
+        return False
+    if sys.platform == 'win32':
+        return True
+    if sys.platform != 'darwin':
+        return False
+    return os.getenv('TERM_PROGRAM', '') in ('Apple_Terminal', 'iTerm.app')
+
+
+def _is_clean_quit(code: int) -> bool:
+    """Ctrl+C and a normal zero exit both count as a clean quit."""
+    try:
+        value = int(code)
+    except (TypeError, ValueError):
+        return False
+    return value == 0 or value in _CTRL_C_EXIT_CODES or (value & 0xFFFFFFFF) in _CTRL_C_EXIT_CODES
+
+
+def _close_windows_console() -> None:
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        kernel32.GetConsoleWindow.restype = wintypes.HWND
+        user32.PostMessageW.argtypes = (
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        user32.PostMessageW.restype = wintypes.BOOL
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            user32.PostMessageW(hwnd, 0x0010, 0, 0)
+    except (AttributeError, OSError):
+        return
+
+
+def _close_macos_terminal() -> None:
+    try:
+        tty_name = os.ttyname(0)
+    except OSError:
+        return
+    aliases = {tty_name}
+    if tty_name.startswith('/dev/'):
+        aliases.add(tty_name[5:])
+    term = os.getenv('TERM_PROGRAM', '')
+    if term == 'Apple_Terminal':
+        match = ' or '.join(
+            f'tty of selected tab is "{name}"' for name in sorted(aliases)
+        )
+        script = (
+            'tell application "Terminal"\n'
+            f'  close (every window whose {match}) saving no\n'
+            'end tell'
+        )
+    else:
+        checks = ' or '.join(f'tty of s is "{name}"' for name in sorted(aliases))
+        script = (
+            'tell application "iTerm"\n'
+            '  repeat with w in windows\n'
+            '    repeat with t in tabs of w\n'
+            '      repeat with s in sessions of t\n'
+            f'        if {checks} then\n'
+            '          tell s to close\n'
+            '          return\n'
+            '        end if\n'
+            '      end repeat\n'
+            '    end repeat\n'
+            '  end repeat\n'
+            'end tell'
+        )
+    try:
+        subprocess.Popen(
+            ['osascript', '-e', script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return
+
+
+def _close_launcher_window() -> None:
+    """Close the Terminal / cmd window that launched this process from start.*."""
+    if not _should_close_launcher_window():
+        return
+    if sys.platform == 'win32':
+        _close_windows_console()
+        return
+    _close_macos_terminal()
+
+
 def _pause_and_exit(message: str, code: int = 1) -> None:
     print(message, file=sys.stderr)
     try:
         input('Press Enter to close this window...')
     except EOFError:
         pass
+    _close_launcher_window()
     raise SystemExit(code)
 
 
@@ -154,10 +257,16 @@ def main() -> None:
     print()
     threading.Thread(target=open_browser_when_ready, daemon=True).start()
     try:
-        raise SystemExit(subprocess.call([str(python), str(APP)], cwd=str(PROJECT_DIR)))
+        code = subprocess.call([str(python), str(APP)], cwd=str(PROJECT_DIR))
     except KeyboardInterrupt:
         print('\nStopped.')
-        raise SystemExit(0)
+        code = 0
+    if _is_clean_quit(code):
+        if code != 0:
+            print('\nStopped.')
+        code = 0
+        _close_launcher_window()
+    raise SystemExit(code)
 
 
 if __name__ == '__main__':

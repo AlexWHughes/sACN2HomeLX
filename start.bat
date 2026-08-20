@@ -1,6 +1,7 @@
 @echo off
 setlocal DisableDelayedExpansion
 cd /d "%~dp0"
+set SACN2HOMELX_CLOSE_WINDOW=1
 setlocal EnableDelayedExpansion
 
 where py >nul 2>&1
