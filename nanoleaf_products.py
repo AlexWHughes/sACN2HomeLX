@@ -78,11 +78,14 @@ def _model_code(model: str) -> str:
     return (model or '').strip().upper()
 
 
+UNKNOWN_SHAPE_TYPE = -1
+
+
 def _as_int(value) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
-        return 0
+        return UNKNOWN_SHAPE_TYPE
 
 
 def product_name(model: str) -> str:

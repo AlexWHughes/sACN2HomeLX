@@ -590,7 +590,7 @@ class TestListLightsApi(unittest.TestCase):
 
     def test_list_lights_includes_unpaired_nanoleaf(self):
         from nanoleaf_client import NanoleafDevice
-        device = NanoleafDevice('nl_canvas1', '192.168.1.80', label='Living Canvas', model='NL29')
+        device = NanoleafDevice('nl_canvas1', '192.168.1.80', label='Living Canvas', model='NL42')
         device.panel_ids = [1, 2, 3, 4]
         device.panel_layout = [
             {'id': 1, 'x': 0, 'y': 100, 'o': 0, 'shapeType': 8},
@@ -1855,12 +1855,14 @@ class TestNanoleafAuthSecrets(unittest.TestCase):
     def setUp(self):
         self._mappings = dict(app.light_mappings)
         self._auth = dict(app.nanoleaf_auth)
+        self._auth_config = dict(app._nanoleaf_auth_config)
         self._lifx = app.lifx_interface
         self._sacn = app.sacn_interface
 
     def tearDown(self):
         app.light_mappings = self._mappings
         app.nanoleaf_auth = self._auth
+        app._nanoleaf_auth_config = self._auth_config
         app.lifx_interface = self._lifx
         app.sacn_interface = self._sacn
 
@@ -1869,14 +1871,35 @@ class TestNanoleafAuthSecrets(unittest.TestCase):
             config_path = os.path.join(tmp, 'config.json')
             secrets_path = os.path.join(tmp, 'nanoleaf_auth.json')
             with open(config_path, 'w') as handle:
-                json.dump({'mappings': {}, 'settings': {'nanoleaf_auth': {}}}, handle)
+                json.dump({
+                    'mappings': {},
+                    'settings': {
+                        'nanoleaf_auth': {
+                            'nl_config': {
+                                'auth_token': 'from-config',
+                                'ip': '10.0.0.7',
+                                'port': 16021,
+                            },
+                            'nl_shared': {
+                                'auth_token': 'from-config-shared',
+                                'ip': '10.0.0.6',
+                                'port': 16021,
+                            },
+                        }
+                    },
+                }, handle)
             with open(secrets_path, 'w') as handle:
                 json.dump({
                     'nl_file': {
                         'auth_token': 'from-file',
                         'ip': '10.0.0.8',
                         'port': 16021,
-                    }
+                    },
+                    'nl_shared': {
+                        'auth_token': 'from-file-shared',
+                        'ip': '10.0.0.5',
+                        'port': 16021,
+                    },
                 }, handle)
             env_auth = json.dumps({
                 'nl_env': {
@@ -1890,8 +1913,17 @@ class TestNanoleafAuthSecrets(unittest.TestCase):
                 'NANOLEAF_AUTH': env_auth,
             }):
                 app.load_config()
+                app.save_config()
+            with open(config_path) as handle:
+                saved_auth = json.load(handle)['settings']['nanoleaf_auth']
+        self.assertEqual(app.nanoleaf_auth['nl_config']['auth_token'], 'from-config')
         self.assertEqual(app.nanoleaf_auth['nl_file']['auth_token'], 'from-file')
         self.assertEqual(app.nanoleaf_auth['nl_env']['auth_token'], 'from-env')
+        self.assertEqual(app.nanoleaf_auth['nl_shared']['auth_token'], 'from-file-shared')
+        self.assertEqual(saved_auth['nl_config']['auth_token'], 'from-config')
+        self.assertEqual(saved_auth['nl_shared']['auth_token'], 'from-config-shared')
+        self.assertNotIn('nl_file', saved_auth)
+        self.assertNotIn('nl_env', saved_auth)
 
 
 if __name__ == '__main__':

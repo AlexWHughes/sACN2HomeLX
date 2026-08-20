@@ -1415,7 +1415,9 @@
             }
             const pending = panelRotationPending[lightId];
             const rotation = pending != null ? pending : data.map_rotation;
-            const orientations = panelOrientPending[lightId] || data.panel_orientations;
+            const orientations = data.panel_orientations != null
+                ? data.panel_orientations
+                : panelOrientPending[lightId];
             applyAddressingLocally(lightId, data.panel_ids, rotation, orientations);
             return data;
         }
@@ -2515,7 +2517,7 @@
             persistAnimation(lightId, type);
             if (pattern === 'rainbow') {
                 let offset = 0;
-                const tickMs = 80;
+                const tickMs = Math.max(100, getAnimationUpdateInterval());
                 const tick = () => {
                     const cycleMs = Math.max(4000, getAnimationUpdateInterval() * 24);
                     fetch('/api/lights/test-pixels', {

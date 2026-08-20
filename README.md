@@ -173,7 +173,7 @@ Rhythm modules, Shapes controller tiles, Lines connectors, and power/controller 
 
 ### Pair a Nanoleaf
 
-You pair **once per controller**. The token is stored locally in gitignored `config.json` under `settings.nanoleaf_auth`. You can also supply tokens via the `NANOLEAF_AUTH` environment variable (JSON object of device id → `{auth_token, ip, port}`) or an untracked secrets file (`nanoleaf_auth.json`, or the path in `NANOLEAF_AUTH_FILE`). Treat the token like a password. It survives app restarts and unmapping the fixture until the controller is factory-reset.
+You pair **once per controller**. The token is stored locally in gitignored `config.json` under `settings.nanoleaf_auth`. You can also supply tokens via the `NANOLEAF_AUTH` environment variable (JSON object of device id → `{auth_token, ip, port}`) or an untracked secrets file (`nanoleaf_auth.json`, or the path in `NANOLEAF_AUTH_FILE`). The secrets file accepts either a top-level device-id-to-record map or an object with that map under a `nanoleaf_auth` key; the `config.json` `{settings: {nanoleaf_auth}}` wrapper is not accepted for this file. Treat the token like a password. It survives app restarts and unmapping the fixture until the controller is factory-reset.
 
 #### Shapes, Canvas, Light Panels, Elements, Lines, Blocks
 

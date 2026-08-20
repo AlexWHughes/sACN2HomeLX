@@ -254,7 +254,7 @@ def main() -> None:
         if code != 0:
             print('\nStopped.')
         code = 0
-    _close_launcher_window()
+        _close_launcher_window()
     raise SystemExit(code)
 
 

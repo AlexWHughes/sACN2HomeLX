@@ -51,6 +51,8 @@ class TestNanoleafProducts(unittest.TestCase):
         self.assertEqual(layout_product_name('NL42', [7, 7]), 'Shapes: Hexagon')
         self.assertEqual(layout_product_name('NL42', [8, 7]), 'Shapes: Mixed')
         self.assertEqual(layout_product_name('NL59', [17, 18]), 'Lines')
+        self.assertEqual(layout_product_name('', ['bad']), '')
+        self.assertNotEqual(shape_side_length('bad'), 150)
 
     def test_shape_kind_and_side(self):
         self.assertEqual(shape_kind(8), 'triangle')
@@ -417,6 +419,39 @@ class TestIdentifyPanel(unittest.TestCase):
         self.assertFalse(device.ext_control_active)
         last_by_id = {row[0]: row[1:] for row in streamed[-1]}
         self.assertNotEqual(last_by_id[11][:3], (255, 255, 255))
+
+    def test_identify_panel_restores_named_effect(self):
+        from nanoleaf_client import NanoleafClient, NanoleafDevice
+        client = NanoleafClient()
+        self.addCleanup(client.close)
+        device = NanoleafDevice('nl_x', '127.0.0.1', auth_token='tok', model='NL59')
+        device.panel_layout = [
+            {'id': 10, 'x': 0, 'y': 0, 'shapeType': 18},
+            {'id': 11, 'x': 77, 'y': 0, 'shapeType': 18},
+        ]
+        snapshot = {
+            'on': True,
+            'brightness': 40,
+            'colorMode': 'effect',
+            'effect': 'Nemo',
+        }
+        requests = []
+
+        def fake_http(method, url, body=None):
+            requests.append((method, url, body))
+            return 200, {}
+
+        def prepare(dev):
+            dev.ext_control_active = True
+
+        with patch.object(client, 'ensure_layout', return_value=device), patch.object(client, 'prepare_streaming', side_effect=prepare), patch.object(client, '_snapshot_rest_state', return_value=snapshot), patch.object(client, '_put_state') as put_state, patch.object(client, '_stream'), patch('nanoleaf_client.time.sleep'), patch('nanoleaf_client._http_json', side_effect=fake_http):
+            client.identify_panel(device, 11, wait=True)
+        put_state.assert_not_called()
+        self.assertTrue(any(
+            method == 'PUT' and body == {'select': 'Nemo'}
+            for method, _url, body in requests
+        ))
+        self.assertFalse(device.ext_control_active)
 
     def test_identify_panel_rejects_unknown(self):
         from nanoleaf_client import NanoleafClient, NanoleafDevice, NanoleafError

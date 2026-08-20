@@ -103,7 +103,8 @@ lifx_client: Optional[LifxLanClient] = None
 nanoleaf_client: Optional[NanoleafClient] = None
 dmx_receiver: Optional[DMXReceiver] = None
 light_mappings: Dict[str, Dict] = {}  # light_id -> {universe, start_channel, brightness}
-nanoleaf_auth: Dict[str, Dict] = {}  # light_id -> {auth_token, ip, port}
+nanoleaf_auth: Dict[str, Dict] = {}  # runtime: config + env/secrets overlay
+_nanoleaf_auth_config: Dict[str, Dict] = {}  # persisted to config.json only
 running = False
 dmx_thread: Optional[threading.Thread] = None
 lifx_interface: Optional[str] = None  # Network interface IP for LIFX / Nanoleaf discovery
@@ -421,9 +422,24 @@ def _dmx_decode_to_cmd(
     raise ValueError(f'Unhandled channel mode kind: {kind}')
 
 
+def _merge_nanoleaf_auth(config_auth: Dict[str, Dict]) -> None:
+    """Runtime auth is config-backed tokens plus env/secrets overlay."""
+    global nanoleaf_auth, _nanoleaf_auth_config
+    _nanoleaf_auth_config = {
+        device_id: dict(record) for device_id, record in config_auth.items()
+    }
+    nanoleaf_auth = {
+        device_id: dict(record) for device_id, record in _nanoleaf_auth_config.items()
+    }
+    nanoleaf_auth.update({
+        device_id: dict(record)
+        for device_id, record in _load_nanoleaf_auth_secrets().items()
+    })
+
+
 def load_config():
     """Load configuration (mappings and settings) from file"""
-    global light_mappings, lifx_interface, sacn_interface, nanoleaf_auth
+    global light_mappings, lifx_interface, sacn_interface
     try:
         with open(CONFIG_FILE, 'r') as f:
             content = f.read().strip()
@@ -432,7 +448,7 @@ def load_config():
                 light_mappings = {}
                 lifx_interface = None
                 sacn_interface = None
-                nanoleaf_auth = _load_nanoleaf_auth_secrets()
+                _merge_nanoleaf_auth({})
                 invalidate_dmx_mapping_cache()
                 return
             
@@ -441,20 +457,19 @@ def load_config():
             settings = config.get('settings', {})
             lifx_interface = settings.get('lifx_interface', None)
             sacn_interface = settings.get('sacn_interface', None)
-            nanoleaf_auth = _sanitize_nanoleaf_auth(settings.get('nanoleaf_auth', {}))
-            nanoleaf_auth.update(_load_nanoleaf_auth_secrets())
+            _merge_nanoleaf_auth(_sanitize_nanoleaf_auth(settings.get('nanoleaf_auth', {})))
             _import_nanoleaf_tokens_from_mappings()
     except FileNotFoundError:
         light_mappings = {}
         lifx_interface = None
         sacn_interface = None
-        nanoleaf_auth = _load_nanoleaf_auth_secrets()
+        _merge_nanoleaf_auth({})
     except (json.JSONDecodeError, ValueError) as e:
         print(f"Warning: Error parsing config.json: {e}. Using empty configuration.")
         light_mappings = {}
         lifx_interface = None
         sacn_interface = None
-        nanoleaf_auth = _load_nanoleaf_auth_secrets()
+        _merge_nanoleaf_auth({})
     invalidate_dmx_mapping_cache()
 
 
@@ -466,7 +481,7 @@ def save_config():
             'settings': {
                 'lifx_interface': lifx_interface,
                 'sacn_interface': sacn_interface,
-                'nanoleaf_auth': nanoleaf_auth,
+                'nanoleaf_auth': _nanoleaf_auth_config,
             }
         }, indent=2)
         directory = os.path.dirname(os.path.abspath(CONFIG_FILE)) or '.'
@@ -548,22 +563,35 @@ def _import_nanoleaf_tokens_from_mappings() -> None:
             if not isinstance(token, str) or not token:
                 continue
             existing = nanoleaf_auth.get(lid, {})
-            nanoleaf_auth[lid] = {
-                'auth_token': token,
-                'ip': mapping.get('ip') or existing.get('ip') or '',
-                'port': mapping.get('port') or existing.get('port') or DEFAULT_API_PORT,
-            }
+            _persist_nanoleaf_auth(
+                lid,
+                token,
+                mapping.get('ip') or existing.get('ip') or '',
+                mapping.get('port') or existing.get('port') or DEFAULT_API_PORT,
+            )
             mapping.pop('auth_token', None)
+
+
+def _persist_nanoleaf_auth(device_id: str, token: str, ip: str = '', port=None) -> None:
+    """Write a config-backed token and keep runtime auth in sync."""
+    global nanoleaf_auth, _nanoleaf_auth_config
+    cleaned = _sanitize_nanoleaf_auth({
+        device_id: {
+            'auth_token': token,
+            'ip': ip or '',
+            'port': DEFAULT_API_PORT if port is None else port,
+        }
+    }).get(device_id)
+    if cleaned is None:
+        return
+    _nanoleaf_auth_config[device_id] = dict(cleaned)
+    nanoleaf_auth[device_id] = dict(cleaned)
 
 
 def _store_nanoleaf_auth(device: NanoleafDevice) -> None:
     if not device.auth_token:
         return
-    nanoleaf_auth[device.id] = {
-        'auth_token': device.auth_token,
-        'ip': device.ip,
-        'port': device.port,
-    }
+    _persist_nanoleaf_auth(device.id, device.auth_token, device.ip, device.port)
 
 
 _GENERIC_MODEL_LABELS = frozenset({
@@ -1061,7 +1089,6 @@ def _pixel_test_commands(
     pattern: str,
     brightness: float,
     chase_index: int = 0,
-    chase_rgb: Optional[Tuple[float, float, float]] = None,
     mapping: Optional[Dict] = None,
     rainbow_offset: Optional[float] = None,
 ) -> List[Tuple[float, float, float, int, float]]:
@@ -2259,11 +2286,12 @@ def update_mapping():
         with _config_lock:
             if vendor == 'nanoleaf' and token:
                 record = nanoleaf_auth.get(mapped_light_id, {})
-                nanoleaf_auth[mapped_light_id] = {
-                    'auth_token': token,
-                    'ip': mapping.get('ip') or record.get('ip') or '',
-                    'port': mapping.get('port') or record.get('port') or DEFAULT_API_PORT,
-                }
+                _persist_nanoleaf_auth(
+                    mapped_light_id,
+                    token,
+                    mapping.get('ip') or record.get('ip') or '',
+                    mapping.get('port') or record.get('port') or DEFAULT_API_PORT,
+                )
             light_mappings[mapped_light_id] = mapping
             _last_sent_values.pop(mapped_light_id, None)
             invalidate_dmx_mapping_cache()
@@ -2485,18 +2513,22 @@ def identify_light():
     if not device.paired:
         return jsonify({'success': False, 'error': 'Pair this Nanoleaf before identifying it'}), 400
     panel_id = data.get('panel_id')
+    requested_panel = None
+    if panel_id is not None:
+        try:
+            requested_panel = int(panel_id)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'panel_id must be an integer'}), 400
     try:
-        if panel_id is not None:
-            nanoleaf_client.identify_panel(device, int(panel_id))
+        if requested_panel is not None:
+            nanoleaf_client.identify_panel(device, requested_panel)
         else:
             nanoleaf_client.identify(device)
-    except (TypeError, ValueError):
-        return jsonify({'success': False, 'error': 'panel_id must be an integer'}), 400
     except NanoleafError as exc:
         return jsonify({'success': False, 'error': str(exc)}), 400
     payload = {'success': True, 'light_label': device.label}
-    if panel_id is not None:
-        payload['panel_id'] = int(panel_id)
+    if requested_panel is not None:
+        payload['panel_id'] = requested_panel
     return jsonify(payload)
 
 
@@ -2872,9 +2904,6 @@ def test_pixels():
     pattern = str(data.get('pattern') or '')
     brightness = data.get('brightness', 1.0)
     fade_ms = data.get('fade_ms', 0 if pattern == 'chase' else FADE_DURATION_MS)
-    r = data.get('r', 255)
-    g = data.get('g', 255)
-    b = data.get('b', 255)
     chase_index = data.get('index', 0)
     rainbow_offset = data.get('offset')
 
@@ -2900,12 +2929,6 @@ def test_pixels():
                 rainbow_offset = None
         except (TypeError, ValueError):
             rainbow_offset = None
-    try:
-        r_i, g_i, b_i = int(r), int(g), int(b)
-    except (TypeError, ValueError):
-        return jsonify({'success': False, 'error': 'RGB values must be 0-255'}), 400
-    if not (0 <= r_i <= 255 and 0 <= g_i <= 255 and 0 <= b_i <= 255):
-        return jsonify({'success': False, 'error': 'RGB values must be 0-255'}), 400
 
     light = _light_from_id(requested_light_id)
     if not light:
@@ -2918,7 +2941,6 @@ def test_pixels():
         pattern,
         brightness,
         chase_index=chase_index,
-        chase_rgb=(r_i / 255.0, g_i / 255.0, b_i / 255.0),
         mapping=light_mappings.get(requested_light_id),
         rainbow_offset=rainbow_offset,
     )
