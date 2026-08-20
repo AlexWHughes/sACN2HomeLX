@@ -561,6 +561,8 @@ def _load_nanoleaf_auth_secrets() -> Dict[str, Dict]:
     if env_raw:
         try:
             parsed = json.loads(env_raw)
+            if isinstance(parsed, dict) and isinstance(parsed.get('nanoleaf_auth'), dict):
+                parsed = parsed.get('nanoleaf_auth')
             merged.update(_sanitize_nanoleaf_auth(parsed))
         except json.JSONDecodeError as exc:
             print(f'Warning: Invalid NANOLEAF_AUTH JSON: {exc}')
@@ -570,20 +572,27 @@ def _load_nanoleaf_auth_secrets() -> Dict[str, Dict]:
 def _import_nanoleaf_tokens_from_mappings() -> None:
     """Copy tokens stored on mappings into settings so pairing survives unmapping."""
     with _config_lock:
+        migrated = False
         for lid, mapping in light_mappings.items():
             if _mapping_vendor(lid, mapping) != 'nanoleaf':
                 continue
             token = mapping.get('auth_token')
             if not isinstance(token, str) or not token:
                 continue
-            existing = nanoleaf_auth.get(lid, {})
-            _persist_nanoleaf_auth(
-                lid,
-                token,
-                mapping.get('ip') or existing.get('ip') or '',
-                mapping.get('port') or existing.get('port') or DEFAULT_API_PORT,
-            )
+            existing = _nanoleaf_auth_config.get(lid, {})
+            cleaned = _sanitize_nanoleaf_auth({
+                lid: {
+                    'auth_token': token,
+                    'ip': mapping.get('ip') or existing.get('ip') or '',
+                    'port': mapping.get('port') or existing.get('port') or DEFAULT_API_PORT,
+                }
+            }).get(lid)
+            if cleaned is not None:
+                _nanoleaf_auth_config[lid] = dict(cleaned)
+                migrated = True
             mapping.pop('auth_token', None)
+        if migrated:
+            _refresh_nanoleaf_runtime_auth()
 
 
 def _persist_nanoleaf_auth(device_id: str, token: str, ip: str = '', port=None) -> None:

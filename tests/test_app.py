@@ -469,8 +469,10 @@ class TestListLightsApi(unittest.TestCase):
         self._saved_client = app.lifx_client
         self._saved_nl = app.nanoleaf_client
         self._saved_nl_auth = dict(app.nanoleaf_auth)
+        self._saved_nl_auth_config = dict(app._nanoleaf_auth_config)
         app.nanoleaf_client = None
         app.nanoleaf_auth = {}
+        app._nanoleaf_auth_config = {}
         app._dmx_mapping_cache_dirty = True
         self._schedule_patch = patch.object(app, '_schedule_nanoleaf_hydrate')
         self._schedule_patch.start()
@@ -484,6 +486,7 @@ class TestListLightsApi(unittest.TestCase):
         app.lifx_client = self._saved_client
         app.nanoleaf_client = self._saved_nl
         app.nanoleaf_auth = self._saved_nl_auth
+        app._nanoleaf_auth_config = self._saved_nl_auth_config
         app._dmx_mapping_cache_dirty = True
         app._lifx_hydrate_in_flight = False
         app._lifx_probe_next_attempt.clear()
@@ -773,15 +776,17 @@ class TestListLightsApi(unittest.TestCase):
                 'port': 16021,
             }
         }
-        app.nanoleaf_auth = {
+        app._nanoleaf_auth_config = {
             'nl_legacy': {
                 'auth_token': 'should-be-replaced',
                 'ip': '10.0.0.9',
                 'port': 16022,
             }
         }
-        app._import_nanoleaf_tokens_from_mappings()
+        with patch.dict(os.environ, {'NANOLEAF_AUTH': '', 'NANOLEAF_AUTH_FILE': ''}):
+            app._import_nanoleaf_tokens_from_mappings()
         self.assertNotIn('auth_token', app.light_mappings['nl_legacy'])
+        self.assertEqual(app._nanoleaf_auth_config['nl_legacy']['auth_token'], 'legacy-token')
         self.assertEqual(app.nanoleaf_auth['nl_legacy']['auth_token'], 'legacy-token')
         self.assertEqual(app.nanoleaf_auth['nl_legacy']['ip'], '10.0.0.8')
         self.assertEqual(app.nanoleaf_auth['nl_legacy']['port'], 16021)
@@ -793,17 +798,40 @@ class TestListLightsApi(unittest.TestCase):
                 'auth_token': 'legacy-token',
             }
         }
-        app.nanoleaf_auth = {
+        app._nanoleaf_auth_config = {
             'nl_legacy': {
                 'auth_token': 'old',
                 'ip': '10.0.0.9',
                 'port': 16022,
             }
         }
-        app._import_nanoleaf_tokens_from_mappings()
+        with patch.dict(os.environ, {'NANOLEAF_AUTH': '', 'NANOLEAF_AUTH_FILE': ''}):
+            app._import_nanoleaf_tokens_from_mappings()
         self.assertNotIn('auth_token', app.light_mappings['nl_legacy'])
         self.assertEqual(app.nanoleaf_auth['nl_legacy']['ip'], '10.0.0.9')
         self.assertEqual(app.nanoleaf_auth['nl_legacy']['port'], 16022)
+
+    def test_import_nanoleaf_tokens_defers_to_secrets_overlay(self):
+        app.light_mappings = {
+            'nl_shared': {
+                'vendor': 'nanoleaf',
+                'auth_token': 'from-mapping',
+                'ip': '10.0.0.8',
+                'port': 16021,
+            }
+        }
+        app._nanoleaf_auth_config = {}
+        env_auth = json.dumps({
+            'nl_shared': {
+                'auth_token': 'from-env',
+                'ip': '10.0.0.9',
+                'port': 16021,
+            }
+        })
+        with patch.dict(os.environ, {'NANOLEAF_AUTH': env_auth, 'NANOLEAF_AUTH_FILE': ''}):
+            app._import_nanoleaf_tokens_from_mappings()
+        self.assertEqual(app._nanoleaf_auth_config['nl_shared']['auth_token'], 'from-mapping')
+        self.assertEqual(app.nanoleaf_auth['nl_shared']['auth_token'], 'from-env')
 
     def test_pair_nanoleaf_saves_token(self):
         from nanoleaf_client import NanoleafDevice
@@ -1960,6 +1988,23 @@ class TestNanoleafAuthSecrets(unittest.TestCase):
             with open(config_path) as handle:
                 leftover = handle.read()
         self.assertEqual(leftover, '{not json')
+
+    def test_nanoleaf_auth_env_unwraps_nested_object(self):
+        env_auth = json.dumps({
+            'nanoleaf_auth': {
+                'nl_nested': {
+                    'auth_token': 'from-nested-env',
+                    'ip': '10.0.0.4',
+                    'port': 16021,
+                }
+            }
+        })
+        with patch.dict(os.environ, {
+            'NANOLEAF_AUTH': env_auth,
+            'NANOLEAF_AUTH_FILE': os.path.join(tempfile.gettempdir(), 'missing-nl-auth.json'),
+        }):
+            secrets = app._load_nanoleaf_auth_secrets()
+        self.assertEqual(secrets['nl_nested']['auth_token'], 'from-nested-env')
 
 
 if __name__ == '__main__':
