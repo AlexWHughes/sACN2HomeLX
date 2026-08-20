@@ -1856,6 +1856,7 @@ class TestNanoleafAuthSecrets(unittest.TestCase):
         self._mappings = dict(app.light_mappings)
         self._auth = dict(app.nanoleaf_auth)
         self._auth_config = dict(app._nanoleaf_auth_config)
+        self._save_blocked = app._config_save_blocked
         self._lifx = app.lifx_interface
         self._sacn = app.sacn_interface
 
@@ -1863,6 +1864,7 @@ class TestNanoleafAuthSecrets(unittest.TestCase):
         app.light_mappings = self._mappings
         app.nanoleaf_auth = self._auth
         app._nanoleaf_auth_config = self._auth_config
+        app._config_save_blocked = self._save_blocked
         app.lifx_interface = self._lifx
         app.sacn_interface = self._sacn
 
@@ -1924,6 +1926,40 @@ class TestNanoleafAuthSecrets(unittest.TestCase):
         self.assertEqual(saved_auth['nl_shared']['auth_token'], 'from-config-shared')
         self.assertNotIn('nl_file', saved_auth)
         self.assertNotIn('nl_env', saved_auth)
+
+    def test_parse_failure_keeps_config_auth_and_skips_save(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, 'config.json')
+            with open(config_path, 'w') as handle:
+                json.dump({
+                    'mappings': {},
+                    'settings': {
+                        'nanoleaf_auth': {
+                            'nl_keep': {
+                                'auth_token': 'keep-me',
+                                'ip': '10.0.0.1',
+                                'port': 16021,
+                            }
+                        }
+                    },
+                }, handle)
+            env = {
+                'NANOLEAF_AUTH_FILE': os.path.join(tmp, 'missing-secrets.json'),
+                'NANOLEAF_AUTH': '',
+            }
+            with patch.object(app, 'CONFIG_FILE', config_path), patch.dict(os.environ, env, clear=False):
+                app.load_config()
+                self.assertEqual(app._nanoleaf_auth_config['nl_keep']['auth_token'], 'keep-me')
+                with open(config_path, 'w') as handle:
+                    handle.write('{not json')
+                app.load_config()
+                self.assertEqual(app._nanoleaf_auth_config['nl_keep']['auth_token'], 'keep-me')
+                self.assertEqual(app.nanoleaf_auth['nl_keep']['auth_token'], 'keep-me')
+                self.assertTrue(app._config_save_blocked)
+                app.save_config()
+            with open(config_path) as handle:
+                leftover = handle.read()
+        self.assertEqual(leftover, '{not json')
 
 
 if __name__ == '__main__':

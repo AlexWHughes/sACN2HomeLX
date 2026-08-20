@@ -51,14 +51,25 @@ def _is_clean_quit(code: int) -> bool:
         value = int(code)
     except (TypeError, ValueError):
         return False
-    return value == 0 or (value & 0xFFFFFFFF) in _CTRL_C_EXIT_CODES
+    return value == 0 or value in _CTRL_C_EXIT_CODES or (value & 0xFFFFFFFF) in _CTRL_C_EXIT_CODES
 
 
 def _close_windows_console() -> None:
     try:
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        kernel32.GetConsoleWindow.restype = wintypes.HWND
+        user32.PostMessageW.argtypes = (
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        user32.PostMessageW.restype = wintypes.BOOL
+        hwnd = kernel32.GetConsoleWindow()
         if hwnd:
-            ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+            user32.PostMessageW(hwnd, 0x0010, 0, 0)
     except (AttributeError, OSError):
         return
 

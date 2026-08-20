@@ -105,6 +105,7 @@ dmx_receiver: Optional[DMXReceiver] = None
 light_mappings: Dict[str, Dict] = {}  # light_id -> {universe, start_channel, brightness}
 nanoleaf_auth: Dict[str, Dict] = {}  # runtime: config + env/secrets overlay
 _nanoleaf_auth_config: Dict[str, Dict] = {}  # persisted to config.json only
+_config_save_blocked = False  # True after a parse failure; do not overwrite config.json
 running = False
 dmx_thread: Optional[threading.Thread] = None
 lifx_interface: Optional[str] = None  # Network interface IP for LIFX / Nanoleaf discovery
@@ -422,12 +423,9 @@ def _dmx_decode_to_cmd(
     raise ValueError(f'Unhandled channel mode kind: {kind}')
 
 
-def _merge_nanoleaf_auth(config_auth: Dict[str, Dict]) -> None:
-    """Runtime auth is config-backed tokens plus env/secrets overlay."""
-    global nanoleaf_auth, _nanoleaf_auth_config
-    _nanoleaf_auth_config = {
-        device_id: dict(record) for device_id, record in config_auth.items()
-    }
+def _refresh_nanoleaf_runtime_auth() -> None:
+    """Rebuild runtime auth from config-backed records plus env/secrets overlay."""
+    global nanoleaf_auth
     nanoleaf_auth = {
         device_id: dict(record) for device_id, record in _nanoleaf_auth_config.items()
     }
@@ -437,9 +435,18 @@ def _merge_nanoleaf_auth(config_auth: Dict[str, Dict]) -> None:
     })
 
 
+def _merge_nanoleaf_auth(config_auth: Dict[str, Dict]) -> None:
+    """Runtime auth is config-backed tokens plus env/secrets overlay."""
+    global _nanoleaf_auth_config
+    _nanoleaf_auth_config = {
+        device_id: dict(record) for device_id, record in config_auth.items()
+    }
+    _refresh_nanoleaf_runtime_auth()
+
+
 def load_config():
     """Load configuration (mappings and settings) from file"""
-    global light_mappings, lifx_interface, sacn_interface
+    global light_mappings, lifx_interface, sacn_interface, _config_save_blocked
     try:
         with open(CONFIG_FILE, 'r') as f:
             content = f.read().strip()
@@ -449,6 +456,7 @@ def load_config():
                 lifx_interface = None
                 sacn_interface = None
                 _merge_nanoleaf_auth({})
+                _config_save_blocked = False
                 invalidate_dmx_mapping_cache()
                 return
             
@@ -459,22 +467,28 @@ def load_config():
             sacn_interface = settings.get('sacn_interface', None)
             _merge_nanoleaf_auth(_sanitize_nanoleaf_auth(settings.get('nanoleaf_auth', {})))
             _import_nanoleaf_tokens_from_mappings()
+            _config_save_blocked = False
     except FileNotFoundError:
         light_mappings = {}
         lifx_interface = None
         sacn_interface = None
         _merge_nanoleaf_auth({})
+        _config_save_blocked = False
     except (json.JSONDecodeError, ValueError) as e:
         print(f"Warning: Error parsing config.json: {e}. Using empty configuration.")
         light_mappings = {}
         lifx_interface = None
         sacn_interface = None
-        _merge_nanoleaf_auth({})
+        _refresh_nanoleaf_runtime_auth()
+        _config_save_blocked = True
     invalidate_dmx_mapping_cache()
 
 
 def save_config():
     """Save configuration (mappings and settings) to file"""
+    if _config_save_blocked:
+        print('Warning: Skipping save; config.json failed to parse and must be fixed first.')
+        return
     with _config_lock:
         payload = json.dumps({
             'mappings': light_mappings,

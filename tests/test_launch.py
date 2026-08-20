@@ -43,5 +43,6 @@ class TestCloseLauncherWindow(unittest.TestCase):
     def test_ctrl_c_is_a_clean_quit(self):
         self.assertTrue(launch._is_clean_quit(0))
         self.assertTrue(launch._is_clean_quit(130))
+        self.assertTrue(launch._is_clean_quit(-2))
         self.assertTrue(launch._is_clean_quit(0xC000013A))
         self.assertFalse(launch._is_clean_quit(1))
