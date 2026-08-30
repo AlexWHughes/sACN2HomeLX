@@ -37,6 +37,23 @@
       ],
       "map_rotation": 0,
       "side_length": 134
+    },
+    "ha_light.living_room": {
+      "universe": 1,
+      "start_channel": 10,
+      "brightness": 1.0,
+      "channel_mode": "RGB (8bit)",
+      "label": "Living Room",
+      "model": "HA RGB light",
+      "ip": "homeassistant.local:8123",
+      "vendor": "homeassistant",
+      "entity_id": "light.living_room",
+      "supported_color_modes": ["rgb", "color_temp"],
+      "zone_capable": false,
+      "zone_count": 1,
+      "zone_layout": "single",
+      "matrix_width": 1,
+      "matrix_height": 1
     }
   },
   "settings": {
@@ -48,6 +65,10 @@
         "ip": "192.168.1.11",
         "port": 16021
       }
+    },
+    "homeassistant": {
+      "url": "http://homeassistant.local:8123",
+      "token": "YOUR_HOME_ASSISTANT_LONG_LIVED_TOKEN"
     }
   }
 }

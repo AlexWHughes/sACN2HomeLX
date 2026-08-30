@@ -1,6 +1,6 @@
 # sACN2HomeLX
 
-Control LIFX and Nanoleaf lights via sACN/E1.31 with automatic discovery and a web-based mapping interface.
+Control LIFX, Nanoleaf, and Home Assistant lights via sACN/E1.31 with automatic discovery and a web-based mapping interface.
 
 ![sACN2HomeLX Interface](templates/Example.png)
 
@@ -8,6 +8,7 @@ Control LIFX and Nanoleaf lights via sACN/E1.31 with automatic discovery and a w
 
 - **Automatic LIFX Discovery**: Automatically discovers all LIFX lights on your network using the LIFX LAN protocol
 - **Nanoleaf Open API**: Discovers and pairs panel controllers on the LAN, then maps the whole fixture or individual panels. See [Nanoleaf](#nanoleaf) for supported products and pairing.
+- **Home Assistant lights**: Discovers `light.*` entities via the Home Assistant REST API and drives them from sACN. See [Home Assistant](#home-assistant).
 - **Web UI**: Clean, intuitive web interface for mapping lights to DMX universes and channels
 - **Rename Lights**: Give mapped lights a custom name in the UI; the name is stored in `config.json` and does not change the bulb's LIFX label
 - **E1.31/sACN Support**: Receives DMX via sACN multicast (`239.255.x.x`) and unicast, with real-time universe and packet status
@@ -131,6 +132,29 @@ The server binds to `127.0.0.1` by default (`FLASK_HOST` overrides this). The AP
 
 7. **Stop DMX Processing**:
    - Click "Stop DMX" to halt DMX processing while keeping the server running
+
+## Home Assistant
+
+sACN2HomeLX can drive any `light.*` entity exposed by a Home Assistant instance over the [REST API](https://developers.home-assistant.io/docs/api/rest/).
+
+### Setup
+
+1. In Home Assistant, open your user profile and create a **Long-Lived Access Token**.
+2. In the sACN2HomeLX UI, open **Home Assistant**, enter the instance URL (for example `http://homeassistant.local:8123` or `http://192.168.1.50:8123`), paste the token, and click **Save & test**.
+3. Click **Discover**. HA lights appear alongside LIFX and Nanoleaf with a Home Assistant vendor chip.
+4. Map each entity to a universe and start channel as usual, then press **GO**.
+
+Settings are stored in `config.json` under `settings.homeassistant` (`url`, `token`). You can also set `HOMEASSISTANT_URL` and `HOMEASSISTANT_TOKEN` in the environment; env values override the file at runtime. Treat the token like a password — `config.json` is written mode `0600`, and the UI only shows a masked form.
+
+### Control behaviour
+
+- RGB-capable lights receive `light.turn_on` with `rgb_color` and `brightness`.
+- Color-temp-only lights receive brightness plus `color_temp_kelvin` from the DMX kelvin channel when present.
+- Brightness-only / on-off lights receive the best matching payload (brightness or plain on/off).
+- Black / zero brightness sends `light.turn_off`.
+- Sends are coalesced at **10Hz** by default (`HOMEASSISTANT_BATCH_INTERVAL_MS`, default 100). Optional transition seconds: `HOMEASSISTANT_TRANSITION_S` (default `0.05`).
+
+Home Assistant lights are whole-fixture only (no per-pixel modes). Prefer LIFX LAN or Nanoleaf streaming when you need high rate or multi-zone control on those devices directly.
 
 ## Nanoleaf
 
@@ -363,6 +387,7 @@ Mappings and settings are automatically saved to `config.json` in the project di
 - Network interface settings (discovery and sACN interfaces)
 - Light labels and IP addresses
 - Nanoleaf auth tokens (`settings.nanoleaf_auth` in local `config.json`, or `NANOLEAF_AUTH` / `nanoleaf_auth.json`) — treat these like passwords; they last until the controller is factory-reset. Copy `configHome.example.json` for a placeholder-only template; do not commit real tokens.
+- Home Assistant URL and long-lived token (`settings.homeassistant`, or `HOMEASSISTANT_URL` / `HOMEASSISTANT_TOKEN`) — treat the token like a password.
 
 You can reload the configuration without restarting the application using the "Reload Config" button.
 
@@ -372,6 +397,7 @@ The application is optimized for smooth 40Hz sACN input:
 - **Fade Duration**: 45ms (override with `FADE_DURATION_MS`, e.g. `FADE_DURATION_MS=60 python3 app.py`)
 - **LIFX send interval**: 20ms / 50Hz (override with `LIFX_BATCH_INTERVAL_MS`)
 - **Nanoleaf send interval**: 100ms / 10Hz (override with `NANOLEAF_BATCH_INTERVAL_MS`; the Open API caps streaming at 10Hz)
+- **Home Assistant send interval**: 100ms / 10Hz (override with `HOMEASSISTANT_BATCH_INTERVAL_MS`)
 - **Value Change Threshold**: 1 DMX value (only updates if change exceeds threshold)
 
 A fade a bit longer than the send interval keeps the bulb interpolating toward the latest colour, which hides UDP jitter. If a chase still looks steppy, try `FADE_DURATION_MS=60`. If colours are still skipped, try `LIFX_BATCH_INTERVAL_MS=25` so each bulb is closer to LIFX's ~20 messages/second guideline.
@@ -379,13 +405,13 @@ A fade a bit longer than the send interval keeps the bulb interpolating toward t
 ## Requirements
 
 - Python 3.10+ (install once; `start.command` / `start.bat` handle the rest)
-- LIFX lights and/or Nanoleaf controllers on the same network
+- LIFX lights and/or Nanoleaf controllers on the same network, and/or a reachable Home Assistant instance with a long-lived token
 - DMX/E1.31 source (e.g., lighting console, software)
 - Network interface with multicast support for sACN
 
 ## Technical Details
 
-- **Protocol**: sACN (E1.31) multicast and unicast for DMX reception, LIFX LAN Protocol and the [Nanoleaf Open API](https://nanoleaf.atlassian.net/wiki/spaces/nlapid/pages/2789310530/Nanoleaf+Light+Panels+Open+API+Documentation) for light control
+- **Protocol**: sACN (E1.31) multicast and unicast for DMX reception; LIFX LAN Protocol, the [Nanoleaf Open API](https://nanoleaf.atlassian.net/wiki/spaces/nlapid/pages/2789310530/Nanoleaf+Light+Panels+Open+API+Documentation), and the [Home Assistant REST API](https://developers.home-assistant.io/docs/api/rest/) for light control
 - **Threading**: Multi-threaded architecture with proper synchronization for DMX processing
 - **State Management**: Thread-safe state updates with protection against race conditions
 - **Error Handling**: Robust error handling with graceful degradation
@@ -395,8 +421,9 @@ A fade a bit longer than the send interval keeps the bulb interpolating toward t
 - **`python3` not found / version too old**: Install Python 3.10+ as described in [Install Python (once)](#install-python-once), then open a new terminal. On Windows try `python` instead of `python3`. After Python is on PATH, double-click `start.command` (Mac) or `start.bat` (Windows).
 - **`start.command` will not open on Mac**: Right-click the file → **Open**. If it still fails, in Terminal run `chmod +x start.command` from the project folder.
 - **Browser did not open**: Go to `http://localhost:5001` yourself. Leave the start window open.
-- **Lights not discovered**: Ensure lights are on the same network and powered on. Try using "Add by IP" with the light's IP address.
+- **Lights not discovered**: Ensure lights are on the same network and powered on. Try using "Add by IP" with the light's IP address. For Home Assistant, confirm the URL/token under **Home Assistant** and that the API responds to `GET /api/`.
 - **Nanoleaf pairing fails**: See [Pair a Nanoleaf](#pair-a-nanoleaf). Hold the controller power button until the LED flashes, then click Pair within 30 seconds. A 403 means the pairing window was not open. Skylight must use **Connect to API** in the Nanoleaf app. Tokens survive until a factory reset.
+- **Home Assistant 401**: The long-lived token is missing or revoked. Create a new token in the HA profile and save it again.
 - **DMX not receiving**: Check that the sACN interface is correctly configured and that your DMX source is sending to the correct universe.
 - **Unicast sACN works, multicast does not**: Select the LAN interface your console uses under sACN interface, then Save & Apply and restart DMX. The receiver binds to all addresses so `239.255.x.x` packets arrive, and joins the multicast group on that NIC.
 - **Stepping/jerky transitions**: Restart after this update so the longer fade and direct sends take effect. If it is still steppy, run with `FADE_DURATION_MS=60`. Fast 8-bit RGB chases also look smoother in **HSBK (8bit)** mode because hue is linear.

@@ -347,6 +347,8 @@ class TestMappingVendor(unittest.TestCase):
     def test_prefix_and_stored_vendor(self):
         self.assertEqual(app._mapping_vendor('nl_abc', {}), 'nanoleaf')
         self.assertEqual(app._mapping_vendor('deadbeef', {'vendor': 'nanoleaf'}), 'nanoleaf')
+        self.assertEqual(app._mapping_vendor('ha_light.kitchen', {}), 'homeassistant')
+        self.assertEqual(app._mapping_vendor('deadbeef', {'vendor': 'homeassistant'}), 'homeassistant')
         self.assertEqual(app._mapping_vendor('deadbeef', {}), 'lifx')
 
 
@@ -468,11 +470,17 @@ class TestListLightsApi(unittest.TestCase):
         self._saved_mappings = dict(app.light_mappings)
         self._saved_client = app.lifx_client
         self._saved_nl = app.nanoleaf_client
+        self._saved_ha = app.homeassistant_client
         self._saved_nl_auth = dict(app.nanoleaf_auth)
         self._saved_nl_auth_config = dict(app._nanoleaf_auth_config)
+        self._saved_ha_config = dict(app._homeassistant_config)
+        self._saved_ha_settings = dict(app.homeassistant_settings)
         app.nanoleaf_client = None
+        app.homeassistant_client = None
         app.nanoleaf_auth = {}
         app._nanoleaf_auth_config = {}
+        app._homeassistant_config = {'url': '', 'token': ''}
+        app.homeassistant_settings = {'url': '', 'token': ''}
         app._dmx_mapping_cache_dirty = True
         self._schedule_patch = patch.object(app, '_schedule_nanoleaf_hydrate')
         self._schedule_patch.start()
@@ -485,8 +493,11 @@ class TestListLightsApi(unittest.TestCase):
         app.light_mappings = self._saved_mappings
         app.lifx_client = self._saved_client
         app.nanoleaf_client = self._saved_nl
+        app.homeassistant_client = self._saved_ha
         app.nanoleaf_auth = self._saved_nl_auth
         app._nanoleaf_auth_config = self._saved_nl_auth_config
+        app._homeassistant_config = self._saved_ha_config
+        app.homeassistant_settings = self._saved_ha_settings
         app._dmx_mapping_cache_dirty = True
         app._lifx_hydrate_in_flight = False
         app._lifx_probe_next_attempt.clear()
@@ -617,6 +628,52 @@ class TestListLightsApi(unittest.TestCase):
         self.assertEqual(len(row['panel_layout']), 4)
         self.assertEqual(row['model'], 'Shapes: Triangle')
         self.assertIn('RGB Full Pixel (8bit)', row['supported_modes'])
+
+    def test_list_lights_includes_homeassistant(self):
+        from homeassistant_client import HomeAssistantLight
+        device = HomeAssistantLight(
+            'light.kitchen',
+            label='Kitchen',
+            state='on',
+            supported_color_modes=['rgb', 'color_temp'],
+            ha_host='ha.local:8123',
+        )
+        mock_ha = Mock()
+        mock_ha.get_lights.return_value = [device]
+        mock_ha.configured = True
+        app.homeassistant_client = mock_ha
+        app.homeassistant_settings = {
+            'url': 'http://ha.local:8123',
+            'token': 'secret',
+        }
+        app._homeassistant_config = dict(app.homeassistant_settings)
+        app.lifx_client = None
+        app.nanoleaf_client = None
+        app.light_mappings = {}
+        with patch.object(app, '_ensure_homeassistant_client', return_value=mock_ha):
+            with patch.object(app, '_hydrate_homeassistant_devices'):
+                resp = self.client.get('/api/lights')
+        data = resp.get_json()
+        self.assertEqual(len(data['unconfigured_lights']), 1)
+        row = data['unconfigured_lights'][0]
+        self.assertEqual(row['vendor'], 'homeassistant')
+        self.assertEqual(row['entity_id'], 'light.kitchen')
+        self.assertEqual(row['model'], 'HA RGB light')
+        self.assertIn('RGB (8bit)', row['supported_modes'])
+        self.assertNotIn('RGB Full Pixel (8bit)', row['supported_modes'])
+
+    def test_homeassistant_settings_masks_token(self):
+        app._homeassistant_config = {
+            'url': 'http://ha.local:8123',
+            'token': 'abcdefghijklmnop',
+        }
+        app._refresh_homeassistant_runtime_settings()
+        resp = self.client.get('/api/settings/homeassistant')
+        data = resp.get_json()
+        self.assertTrue(data['success'])
+        self.assertTrue(data['homeassistant']['token_configured'])
+        self.assertNotIn('abcdefghijklmnop', data['homeassistant']['token_masked'])
+        self.assertTrue(data['homeassistant']['token_masked'].endswith('mnop'))
 
     def test_list_lights_hydrates_nanoleaf_layout_onto_mapping(self):
         from nanoleaf_client import NanoleafClient, NanoleafDevice

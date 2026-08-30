@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-sACN2HomeLX - Control LIFX and Nanoleaf lights via sACN/E1.31
+sACN2HomeLX - Control LIFX, Nanoleaf, and Home Assistant lights via sACN/E1.31
 """
 
-VERSION = "160826 012"
+VERSION = "300826 001"
 
 import json
 import os
@@ -40,9 +40,18 @@ from nanoleaf_client import (
     normalize_map_rotation,
     order_panel_ids,
 )
+from homeassistant_client import (
+    HomeAssistantClient,
+    HomeAssistantError,
+    HomeAssistantLight,
+    entity_id_from_ha_id,
+    host_from_url,
+    load_settings_from_env,
+    normalize_base_url,
+)
 
-Vendor = Literal['lifx', 'nanoleaf']
-MappedDevice = Union[LifxLight, NanoleafDevice]
+Vendor = Literal['lifx', 'nanoleaf', 'homeassistant']
+MappedDevice = Union[LifxLight, NanoleafDevice, HomeAssistantLight]
 
 try:
     import ifaddr
@@ -101,15 +110,20 @@ app = Flask(__name__)
 # Global state
 lifx_client: Optional[LifxLanClient] = None
 nanoleaf_client: Optional[NanoleafClient] = None
+homeassistant_client: Optional[HomeAssistantClient] = None
 dmx_receiver: Optional[DMXReceiver] = None
 light_mappings: Dict[str, Dict] = {}  # light_id -> {universe, start_channel, brightness}
 nanoleaf_auth: Dict[str, Dict] = {}  # runtime: config + env/secrets overlay
 _nanoleaf_auth_config: Dict[str, Dict] = {}  # persisted to config.json only
+# Home Assistant connection: config file values, overlaid by env at runtime.
+_homeassistant_config: Dict[str, str] = {'url': '', 'token': ''}
+homeassistant_settings: Dict[str, str] = {'url': '', 'token': ''}
 _config_save_blocked = False  # True after a parse failure; do not overwrite config.json
 running = False
 dmx_thread: Optional[threading.Thread] = None
 lifx_interface: Optional[str] = None  # Network interface IP for LIFX / Nanoleaf discovery
 sacn_interface: Optional[str] = None  # Network interface IP for sACN
+HA_BATCH_WORKERS = 4
 
 # Thread synchronization for DMX state mutations
 dmx_lock = threading.Lock()
@@ -456,6 +470,7 @@ def load_config():
                 lifx_interface = None
                 sacn_interface = None
                 _merge_nanoleaf_auth({})
+                _merge_homeassistant_settings({})
                 _config_save_blocked = False
                 invalidate_dmx_mapping_cache()
                 return
@@ -467,12 +482,14 @@ def load_config():
             sacn_interface = settings.get('sacn_interface', None)
             _merge_nanoleaf_auth(_sanitize_nanoleaf_auth(settings.get('nanoleaf_auth', {})))
             _import_nanoleaf_tokens_from_mappings()
+            _merge_homeassistant_settings(settings.get('homeassistant', {}))
             _config_save_blocked = False
     except FileNotFoundError:
         light_mappings = {}
         lifx_interface = None
         sacn_interface = None
         _merge_nanoleaf_auth({})
+        _merge_homeassistant_settings({})
         _config_save_blocked = False
     except (json.JSONDecodeError, ValueError) as e:
         print(f"Warning: Error parsing config.json: {e}. Using empty configuration.")
@@ -480,6 +497,7 @@ def load_config():
         lifx_interface = None
         sacn_interface = None
         _refresh_nanoleaf_runtime_auth()
+        _refresh_homeassistant_runtime_settings()
         _config_save_blocked = True
     invalidate_dmx_mapping_cache()
 
@@ -496,6 +514,10 @@ def save_config():
                 'lifx_interface': lifx_interface,
                 'sacn_interface': sacn_interface,
                 'nanoleaf_auth': _nanoleaf_auth_config,
+                'homeassistant': {
+                    'url': _homeassistant_config.get('url', ''),
+                    'token': _homeassistant_config.get('token', ''),
+                },
             }
         }, indent=2)
         directory = os.path.dirname(os.path.abspath(CONFIG_FILE)) or '.'
@@ -617,6 +639,101 @@ def _store_nanoleaf_auth(device: NanoleafDevice) -> None:
     _persist_nanoleaf_auth(device.id, device.auth_token, device.ip, device.port)
 
 
+def _sanitize_homeassistant_settings(raw) -> Dict[str, str]:
+    if not isinstance(raw, dict):
+        return {'url': '', 'token': ''}
+    url = raw.get('url') or ''
+    token = raw.get('token') or ''
+    url_str = str(url).strip() if url is not None else ''
+    token_str = str(token).strip() if token is not None else ''
+    if url_str:
+        try:
+            url_str = normalize_base_url(url_str)
+        except HomeAssistantError:
+            # Keep the raw string so the UI can show it; configure() validates later.
+            pass
+    return {'url': url_str, 'token': token_str}
+
+
+def _refresh_homeassistant_runtime_settings() -> None:
+    """Merge config.json HA settings with HOMEASSISTANT_URL / TOKEN env overrides."""
+    global homeassistant_settings
+    merged = {
+        'url': _homeassistant_config.get('url', ''),
+        'token': _homeassistant_config.get('token', ''),
+    }
+    merged.update(load_settings_from_env())
+    homeassistant_settings = {
+        'url': str(merged.get('url') or '').strip(),
+        'token': str(merged.get('token') or '').strip(),
+    }
+    if homeassistant_client is not None:
+        try:
+            homeassistant_client.configure(
+                homeassistant_settings.get('url', ''),
+                homeassistant_settings.get('token', ''),
+            )
+        except HomeAssistantError as exc:
+            print(f'Warning: Invalid Home Assistant settings: {exc}')
+
+
+def _merge_homeassistant_settings(config_settings) -> None:
+    global _homeassistant_config
+    _homeassistant_config = _sanitize_homeassistant_settings(config_settings)
+    _refresh_homeassistant_runtime_settings()
+
+
+def _homeassistant_configured() -> bool:
+    return bool(
+        (homeassistant_settings.get('url') or '').strip()
+        and (homeassistant_settings.get('token') or '').strip()
+    )
+
+
+def _ensure_homeassistant_client() -> Optional[HomeAssistantClient]:
+    global homeassistant_client
+    _refresh_homeassistant_runtime_settings()
+    if not _homeassistant_configured():
+        return homeassistant_client
+    if homeassistant_client is None:
+        try:
+            homeassistant_client = HomeAssistantClient(
+                homeassistant_settings.get('url', ''),
+                homeassistant_settings.get('token', ''),
+            )
+        except HomeAssistantError as exc:
+            print(f'Warning: Could not create Home Assistant client: {exc}')
+            return None
+    else:
+        try:
+            homeassistant_client.configure(
+                homeassistant_settings.get('url', ''),
+                homeassistant_settings.get('token', ''),
+            )
+        except HomeAssistantError as exc:
+            print(f'Warning: Invalid Home Assistant settings: {exc}')
+            return homeassistant_client
+    return homeassistant_client
+
+
+def _hydrate_homeassistant_devices() -> None:
+    """Attach mapped HA lights onto the client so DMX/test can resolve them offline."""
+    client = _ensure_homeassistant_client()
+    if client is None:
+        return
+    records = {}
+    for lid, mapping in light_mappings.items():
+        if _mapping_vendor(lid, mapping) != 'homeassistant':
+            continue
+        records[lid] = {
+            'entity_id': mapping.get('entity_id') or entity_id_from_ha_id(lid),
+            'label': mapping.get('label'),
+            'ip': mapping.get('ip'),
+            'supported_color_modes': mapping.get('supported_color_modes') or [],
+        }
+    client.apply_saved(records)
+
+
 _GENERIC_MODEL_LABELS = frozenset({
     '',
     'unknown',
@@ -624,6 +741,8 @@ _GENERIC_MODEL_LABELS = frozenset({
     'not discovered',
     'nanoleaf',
     'lifx',
+    'home assistant',
+    'homeassistant',
 })
 
 
@@ -878,14 +997,20 @@ def _hydrate_lifx_devices() -> None:
 
 def _mapping_vendor(lid: str, mapping: Optional[Dict] = None) -> Vendor:
     stored = (mapping or {}).get('vendor')
+    if stored == 'homeassistant' or (isinstance(lid, str) and lid.startswith('ha_')):
+        return 'homeassistant'
     if stored == 'nanoleaf' or (isinstance(lid, str) and lid.startswith('nl_')):
         return 'nanoleaf'
     return 'lifx'
 
 
 def _device_vendor(device: Optional[MappedDevice], mapping: Optional[Dict] = None, lid: str = '') -> Vendor:
-    if device is not None and getattr(device, 'vendor', 'lifx') == 'nanoleaf':
-        return 'nanoleaf'
+    if device is not None:
+        vendor = getattr(device, 'vendor', None)
+        if vendor == 'homeassistant':
+            return 'homeassistant'
+        if vendor == 'nanoleaf':
+            return 'nanoleaf'
     return _mapping_vendor(lid, mapping)
 
 
@@ -951,7 +1076,8 @@ def get_network_interfaces():
 
 def light_id(light: MappedDevice) -> str:
     """Generate unique ID for a light"""
-    if getattr(light, 'vendor', None) == 'nanoleaf':
+    vendor = getattr(light, 'vendor', None)
+    if vendor == 'nanoleaf' or vendor == 'homeassistant':
         return light.id
     return light.target.hex()
 
@@ -969,6 +1095,15 @@ def _find_mapped_device(lid: str, mapping: Optional[Dict] = None) -> Optional[Ma
         if client is None:
             return None
         return client.get_device(lid)
+    if vendor == 'homeassistant':
+        client = _ensure_homeassistant_client()
+        if client is None:
+            return None
+        found = client.get_light(lid)
+        if found is not None:
+            return found
+        _hydrate_homeassistant_devices()
+        return client.get_light(lid)
     if lifx_client is None:
         return None
     with lifx_client.lock:
@@ -1002,7 +1137,7 @@ def _display_label(light: Optional[MappedDevice], mapping: Optional[Dict] = None
 def _light_summary(light: MappedDevice, lid: Optional[str] = None, mapping: Optional[Dict] = None) -> Dict:
     resolved_id = lid or light_id(light)
     vendor = _device_vendor(light, mapping, lid=resolved_id)
-    return {
+    summary = {
         'id': resolved_id,
         'label': light.label or f"Light {light.ip}",
         'ip': light.ip,
@@ -1019,6 +1154,14 @@ def _light_summary(light: MappedDevice, lid: Optional[str] = None, mapping: Opti
         ),
         **_light_zone_fields(light),
     }
+    if vendor == 'homeassistant':
+        summary['entity_id'] = getattr(light, 'entity_id', None) or entity_id_from_ha_id(resolved_id)
+        summary['supported_color_modes'] = list(
+            getattr(light, 'supported_color_modes', None)
+            or (mapping or {}).get('supported_color_modes')
+            or []
+        )
+    return summary
 
 
 def _mapping_uses_zones(mapping: Dict) -> bool:
@@ -1279,6 +1422,23 @@ _nl_batch_sender_stop: threading.Event = threading.Event()
 _nl_batch_sender_wake = threading.Event()
 _nl_batch_sender_start_lock = threading.Lock()
 _nl_batch_executor: Optional[ThreadPoolExecutor] = None
+
+# Home Assistant REST is not a high-rate LAN protocol; default to 10Hz like Nanoleaf.
+_ha_batch_commands_by_id: Dict[str, tuple] = {}
+_ha_batch_lock = threading.Lock()
+_ha_last_batch_time = 0.0
+try:
+    HOMEASSISTANT_BATCH_INTERVAL = max(
+        0.05, float(os.getenv('HOMEASSISTANT_BATCH_INTERVAL_MS', '100')) / 1000.0
+    )
+except ValueError:
+    print("Warning: Invalid HOMEASSISTANT_BATCH_INTERVAL_MS; using default 100")
+    HOMEASSISTANT_BATCH_INTERVAL = 0.1
+_ha_batch_sender_thread: Optional[threading.Thread] = None
+_ha_batch_sender_stop: threading.Event = threading.Event()
+_ha_batch_sender_wake = threading.Event()
+_ha_batch_sender_start_lock = threading.Lock()
+_ha_batch_executor: Optional[ThreadPoolExecutor] = None
 
 # Performance monitoring for multi-fixture setups
 _perf_metrics = {
@@ -1616,15 +1776,158 @@ def _ensure_nanoleaf_client() -> NanoleafClient:
     return nanoleaf_client
 
 
+def _ha_send_batch_item(item) -> None:
+    """Send one queued Home Assistant command; log failures without raising."""
+    try:
+        kind = item[0]
+        if kind == 'ha_color':
+            _kind, device, r, g, b, kelvin, duration_ms, brightness = item
+            transition = None
+            try:
+                if duration_ms is not None:
+                    transition = max(0.0, float(duration_ms) / 1000.0)
+            except (TypeError, ValueError):
+                transition = None
+            homeassistant_client.send_color(
+                device, r, g, b, brightness, kelvin=kelvin, transition=transition
+            )
+        else:
+            unreachable: str = kind
+            raise ValueError(f'Unhandled Home Assistant batch kind: {unreachable}')
+    except Exception as exc:
+        device = item[1] if len(item) > 1 else None
+        label = getattr(device, 'label', None) or getattr(device, 'entity_id', None) or 'unknown'
+        msg = f"Error in Home Assistant batch send for {label}: {exc}"
+        if dmx_logger:
+            dmx_logger.warning(msg)
+        else:
+            print(msg)
+
+
+def _ha_send_one_batch():
+    """Drain pending Home Assistant commands if the send interval has elapsed."""
+    global _ha_batch_commands_by_id, _ha_last_batch_time
+
+    if not homeassistant_client:
+        return
+
+    current_time = time.time()
+    if current_time - _ha_last_batch_time < HOMEASSISTANT_BATCH_INTERVAL:
+        return
+
+    with _ha_batch_lock:
+        if not _ha_batch_commands_by_id:
+            return
+        batch = list(_ha_batch_commands_by_id.values())
+        _ha_batch_commands_by_id.clear()
+
+    if not batch:
+        return
+
+    workers = min(HA_BATCH_WORKERS, len(batch))
+    futures = None
+    with _ha_batch_sender_start_lock:
+        executor = _ha_batch_executor
+        if workers > 1 and executor is not None:
+            futures = [executor.submit(_ha_send_batch_item, item) for item in batch]
+    if futures is None:
+        for item in batch:
+            _ha_send_batch_item(item)
+    else:
+        for future in as_completed(futures):
+            future.result()
+
+    _ha_last_batch_time = current_time
+
+
+def _ha_batch_sender_worker(stop_event: threading.Event):
+    global homeassistant_client, _ha_batch_sender_wake
+
+    while True:
+        if stop_event.is_set():
+            break
+        with _ha_batch_lock:
+            pending = len(_ha_batch_commands_by_id) > 0
+        if pending:
+            wait_for = max(0.0, HOMEASSISTANT_BATCH_INTERVAL - (time.time() - _ha_last_batch_time))
+            timeout = min(max(wait_for, 0.0005), HOMEASSISTANT_BATCH_INTERVAL)
+        else:
+            timeout = 0.1
+        _ha_batch_sender_wake.wait(timeout=timeout)
+        if stop_event.is_set():
+            break
+        _ha_batch_sender_wake.clear()
+        while not stop_event.is_set():
+            if not homeassistant_client:
+                break
+            with _ha_batch_lock:
+                if not _ha_batch_commands_by_id:
+                    break
+            if time.time() - _ha_last_batch_time < HOMEASSISTANT_BATCH_INTERVAL:
+                break
+            _ha_send_one_batch()
+
+
+def _start_ha_batch_sender_thread():
+    global _ha_batch_sender_thread, _ha_batch_sender_stop, _ha_batch_sender_wake, _ha_batch_executor
+
+    with _ha_batch_sender_start_lock:
+        if _ha_batch_sender_thread is not None and _ha_batch_sender_thread.is_alive():
+            return
+        if _ha_batch_executor is None:
+            _ha_batch_executor = ThreadPoolExecutor(
+                max_workers=HA_BATCH_WORKERS, thread_name_prefix='ha_batch'
+            )
+        stop_event = threading.Event()
+        _ha_batch_sender_stop = stop_event
+        _ha_batch_sender_wake.clear()
+        t = threading.Thread(
+            target=_ha_batch_sender_worker,
+            args=(stop_event,),
+            daemon=True,
+            name='ha_batch_sender',
+        )
+        _ha_batch_sender_thread = t
+        t.start()
+
+
+def _stop_ha_batch_sender_thread():
+    global _ha_batch_sender_thread, _ha_batch_executor
+
+    with _ha_batch_sender_start_lock:
+        t = _ha_batch_sender_thread
+        executor = _ha_batch_executor
+        _ha_batch_executor = None
+        if t is None:
+            if executor is not None:
+                executor.shutdown(wait=False)
+            return
+        with _ha_batch_lock:
+            _ha_batch_commands_by_id.clear()
+        _ha_batch_sender_stop.set()
+        _ha_batch_sender_wake.set()
+        _ha_batch_sender_thread = None
+    t.join(timeout=1.0)
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+
 def _enqueue_device_command(cmd: tuple) -> None:
     """Queue a decoded colour/zone command for the matching vendor sender."""
     device = cmd[1]
     lid = light_id(device)
-    if _device_vendor(device, lid=lid) == 'nanoleaf':
+    vendor = _device_vendor(device, lid=lid)
+    if vendor == 'nanoleaf':
         with _nl_batch_lock:
             _nl_batch_commands_by_id[lid] = cmd
         _start_nl_batch_sender_thread()
         _nl_batch_sender_wake.set()
+        return
+    if vendor == 'homeassistant':
+        with _ha_batch_lock:
+            _ha_batch_commands_by_id[lid] = cmd
+        _start_ha_batch_sender_thread()
+        _ha_batch_sender_wake.set()
         return
     with _batch_lock:
         _batch_commands_by_id[lid] = cmd
@@ -1638,7 +1941,7 @@ def process_dmx_data(dmx_data: list, universe: int):
     
     if not running:
         return
-    if not lifx_client and not nanoleaf_client:
+    if not lifx_client and not nanoleaf_client and not homeassistant_client:
         return
     
     _rebuild_dmx_mapping_cache_if_dirty()
@@ -1669,6 +1972,9 @@ def process_dmx_data(dmx_data: list, universe: int):
         for device in nanoleaf_client.get_devices():
             if device.paired:
                 lights_by_id[device.id] = device
+    if homeassistant_client:
+        for device in homeassistant_client.get_lights():
+            lights_by_id[device.id] = device
     
     frame_batch: List[tuple] = []
     
@@ -1723,7 +2029,17 @@ def process_dmx_data(dmx_data: list, universe: int):
                 physical, width, height = _geometry_for(light, mapping)
                 expanded = _expand_control_cells_to_zones(zone_cmds, max(physical, 1), width, height)
                 if expanded:
-                    kind = 'nl_zones' if vendor == 'nanoleaf' else 'zones'
+                    if vendor == 'nanoleaf':
+                        kind = 'nl_zones'
+                    elif vendor == 'homeassistant':
+                        # HA lights are whole-fixture; use the first cell colour.
+                        first = expanded[0]
+                        frame_batch.append(
+                            ('ha_color', light, first[0], first[1], first[2], first[3], duration_ms, first[4])
+                        )
+                        continue
+                    else:
+                        kind = 'zones'
                     frame_batch.append((kind, light, expanded, duration_ms))
             continue
         
@@ -1736,7 +2052,12 @@ def process_dmx_data(dmx_data: list, universe: int):
                     f"  → {light.label}: RGB=({rgb_int[0]},{rgb_int[1]},{rgb_int[2]}), "
                     f"DMX={channel_values}, brightness={cmd_data[5]:.2f}, fade={FADE_DURATION_MS}ms"
                 )
-            kind = 'nl_color' if vendor == 'nanoleaf' else 'color'
+            if vendor == 'nanoleaf':
+                kind = 'nl_color'
+            elif vendor == 'homeassistant':
+                kind = 'ha_color'
+            else:
+                kind = 'color'
             frame_batch.append((kind, light, *cmd_data))
     
     for cmd in frame_batch:
@@ -1921,6 +2242,15 @@ def list_lights():
         for device in nanoleaf_client.get_devices():
             lights_list.append(device)
             discovered_by_id[device.id] = device
+    if _homeassistant_configured() or any(
+        _mapping_vendor(lid, mapping) == 'homeassistant' for lid, mapping in light_mappings.items()
+    ):
+        ha_client = _ensure_homeassistant_client()
+        if ha_client is not None:
+            _hydrate_homeassistant_devices()
+            for device in ha_client.get_lights():
+                lights_list.append(device)
+                discovered_by_id[device.id] = device
     
     all_configured = [
         _configured_light_row(
@@ -1982,6 +2312,20 @@ def _interfaces_payload():
         'lifx_interface': lifx_interface,
         'sacn_interface': sacn_interface,
         'discovery_interface': lifx_interface,
+        'homeassistant': _homeassistant_public_settings(),
+    }
+
+
+def _homeassistant_public_settings() -> Dict[str, object]:
+    """Settings safe to return to the UI (token masked)."""
+    url = homeassistant_settings.get('url') or ''
+    token = homeassistant_settings.get('token') or ''
+    return {
+        'url': url,
+        'token_configured': bool(token),
+        'token_masked': ('*' * 8 + token[-4:]) if len(token) > 4 else ('********' if token else ''),
+        'configured': _homeassistant_configured(),
+        'host': host_from_url(url) if url else '',
     }
 
 
@@ -2070,9 +2414,55 @@ def apply_interfaces():
     })
 
 
+@app.route('/api/settings/homeassistant', methods=['GET'])
+def get_homeassistant_settings():
+    """Return Home Assistant connection settings (token masked)."""
+    _refresh_homeassistant_runtime_settings()
+    return jsonify({'success': True, 'homeassistant': _homeassistant_public_settings()})
+
+
+@app.route('/api/settings/homeassistant', methods=['POST'])
+def set_homeassistant_settings():
+    """Save Home Assistant URL and optional token; empty token keeps the existing one."""
+    if not request.is_json:
+        return jsonify({'success': False, 'error': 'Request must be JSON'}), 400
+    data = request.json or {}
+    url = data.get('url')
+    token = data.get('token')
+    current = dict(_homeassistant_config)
+    if url is not None:
+        current['url'] = str(url).strip()
+    if token is not None and str(token).strip():
+        current['token'] = str(token).strip()
+    elif token is not None and str(token).strip() == '' and data.get('clear_token'):
+        current['token'] = ''
+    try:
+        if current.get('url'):
+            current['url'] = normalize_base_url(current['url'])
+    except HomeAssistantError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    _merge_homeassistant_settings(current)
+    save_config()
+    client = _ensure_homeassistant_client()
+    tested = False
+    test_error = None
+    if client is not None and client.configured and data.get('test', True):
+        try:
+            client.ping()
+            tested = True
+        except HomeAssistantError as exc:
+            test_error = str(exc)
+    return jsonify({
+        'success': True,
+        'homeassistant': _homeassistant_public_settings(),
+        'tested': tested,
+        'test_error': test_error,
+    })
+
+
 @app.route('/api/lights/discover', methods=['POST'])
 def discover_lights():
-    """Discover LIFX and Nanoleaf lights on the network"""
+    """Discover LIFX, Nanoleaf, and Home Assistant lights"""
     global lifx_client
     
     lifx_bind_ip = _normalize_interface_ip(lifx_interface)
@@ -2091,6 +2481,7 @@ def discover_lights():
             return jsonify({"success": False, "error": str(e)}), 500
 
     nl_client = _ensure_nanoleaf_client()
+    ha_client = _ensure_homeassistant_client()
     
     try:
         lights = lifx_client.discover_lights(timeout=5.0)
@@ -2103,6 +2494,15 @@ def discover_lights():
                 except NanoleafError as exc:
                     print(f"Nanoleaf refresh failed for {device.ip}: {exc}")
         _hydrate_nanoleaf_devices()
+        ha_devices: List[HomeAssistantLight] = []
+        ha_error = None
+        if ha_client is not None and ha_client.configured:
+            try:
+                ha_devices = ha_client.discover()
+                _hydrate_homeassistant_devices()
+            except HomeAssistantError as exc:
+                ha_error = str(exc)
+                print(f"Home Assistant discovery failed: {exc}")
         lights_data = [
             {
                 **_light_summary(light),
@@ -2122,7 +2522,21 @@ def discover_lights():
             }
             for device in nanoleaf_devices
         ])
-        return jsonify({'success': True, 'lights': lights_data})
+        lights_data.extend([
+            {
+                **_light_summary(device),
+                'entity_id': device.entity_id,
+                'supported_color_modes': list(device.supported_color_modes),
+                'supported_modes': _supported_modes_for(device),
+                'mode_options': _mode_options_for(device),
+                'pixel_test_patterns': [],
+            }
+            for device in ha_devices
+        ])
+        payload = {'success': True, 'lights': lights_data}
+        if ha_error:
+            payload['homeassistant_error'] = ha_error
+        return jsonify(payload)
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -2211,6 +2625,22 @@ def update_mapping():
                 matched_light = device
                 if not light_label:
                     light_label = device.label
+        if matched_light is None and (
+            _mapping_vendor(mapped_light_id, existing_mapping) == 'homeassistant'
+            or (isinstance(mapped_light_id, str) and mapped_light_id.startswith('ha_'))
+        ):
+            ha_client = _ensure_homeassistant_client()
+            if ha_client is not None:
+                device = ha_client.get_light(mapped_light_id)
+                if device is None:
+                    _hydrate_homeassistant_devices()
+                    device = ha_client.get_light(mapped_light_id)
+                if device is not None:
+                    light_model = device.model_name or light_model
+                    light_ip = device.ip or light_ip
+                    matched_light = device
+                    if not light_label:
+                        light_label = device.label
 
         requested_label = data.get('label')
         if isinstance(requested_label, str):
@@ -2305,6 +2735,15 @@ def update_mapping():
                     mapping.get('panel_ids'),
                 )
                 mapping['side_length'] = existing_mapping.get('side_length')
+        if vendor == 'homeassistant':
+            entity = existing_mapping.get('entity_id') or entity_id_from_ha_id(mapped_light_id)
+            modes = existing_mapping.get('supported_color_modes') or []
+            if matched_light is not None:
+                entity = getattr(matched_light, 'entity_id', None) or entity
+                modes = list(getattr(matched_light, 'supported_color_modes', None) or modes)
+                mapping['ip'] = getattr(matched_light, 'ip', None) or mapping.get('ip')
+            mapping['entity_id'] = entity
+            mapping['supported_color_modes'] = modes
         mapping.pop('auth_token', None)
         with _config_lock:
             if vendor == 'nanoleaf' and token:
@@ -2695,10 +3134,16 @@ def start_dmx():
         if nanoleaf_auth or any(_mapping_vendor(lid, mapping) == 'nanoleaf' for lid, mapping in light_mappings.items()):
             _ensure_nanoleaf_client()
             _hydrate_nanoleaf_devices()
+        if _homeassistant_configured() or any(
+            _mapping_vendor(lid, mapping) == 'homeassistant' for lid, mapping in light_mappings.items()
+        ):
+            _ensure_homeassistant_client()
+            _hydrate_homeassistant_devices()
         
         has_lifx = lifx_client is not None
         has_nanoleaf = nanoleaf_client is not None and bool(nanoleaf_client.paired_devices())
-        if not has_lifx and not has_nanoleaf and not light_mappings:
+        has_ha = homeassistant_client is not None and bool(homeassistant_client.get_lights())
+        if not has_lifx and not has_nanoleaf and not has_ha and not light_mappings:
             return jsonify({'success': False, 'error': 'No lights discovered'}), 400
     
     try:
@@ -2723,6 +3168,8 @@ def start_dmx():
         _start_lifx_batch_sender_thread()
         if nanoleaf_client and nanoleaf_client.paired_devices():
             _start_nl_batch_sender_thread()
+        if homeassistant_client and homeassistant_client.get_lights():
+            _start_ha_batch_sender_thread()
         
         return jsonify({'success': True})
     except Exception as e:
@@ -2741,6 +3188,7 @@ def stop_dmx():
     
     _stop_lifx_batch_sender_thread()
     _stop_nl_batch_sender_thread()
+    _stop_ha_batch_sender_thread()
     
     if dmx_receiver:
         dmx_receiver.stop()
@@ -2783,6 +3231,11 @@ def get_status():
     if nanoleaf_client:
         try:
             discovered_count += len(nanoleaf_client.get_devices())
+        except Exception:
+            pass
+    if homeassistant_client:
+        try:
+            discovered_count += len(homeassistant_client.get_lights())
         except Exception:
             pass
     
@@ -2829,6 +3282,15 @@ def _light_from_id(requested_light_id: str) -> Optional[MappedDevice]:
             nl_client.ensure_layout(device)
             return device
         return None
+    if _mapping_vendor(requested_light_id, mapping) == 'homeassistant':
+        ha_client = _ensure_homeassistant_client()
+        if ha_client is None:
+            return None
+        device = ha_client.get_light(requested_light_id)
+        if device is not None:
+            return device
+        _hydrate_homeassistant_devices()
+        return ha_client.get_light(requested_light_id)
     found = _find_mapped_device(requested_light_id, mapping)
     if found is not None:
         return found
@@ -2845,7 +3307,7 @@ def test_rgb():
     """Test RGB values directly on a light (DMX-less testing)"""
     global lifx_client
     
-    if not lifx_client and not nanoleaf_client:
+    if not lifx_client and not nanoleaf_client and not homeassistant_client:
         return jsonify({'success': False, 'error': 'No lighting client initialized'}), 400
     
     data = request.get_json()
@@ -2886,7 +3348,12 @@ def test_rgb():
     
     try:
         vendor = _device_vendor(light, light_mappings.get(requested_light_id), requested_light_id)
-        kind = 'nl_color' if vendor == 'nanoleaf' else 'color'
+        if vendor == 'nanoleaf':
+            kind = 'nl_color'
+        elif vendor == 'homeassistant':
+            kind = 'ha_color'
+        else:
+            kind = 'color'
         cmd = (
             kind,
             light,
@@ -2916,7 +3383,7 @@ def test_pixels():
     """Send a per-pixel test pattern to a SuperColour / matrix / strip fixture."""
     global lifx_client
 
-    if not lifx_client and not nanoleaf_client:
+    if not lifx_client and not nanoleaf_client and not homeassistant_client:
         return jsonify({'success': False, 'error': 'No lighting client initialized'}), 400
 
     data = request.get_json()
@@ -3046,6 +3513,7 @@ def get_metrics():
         'batch_config': {
             'batch_interval_ms': BATCH_INTERVAL * 1000,
             'nanoleaf_batch_interval_ms': NANOLEAF_BATCH_INTERVAL * 1000,
+            'homeassistant_batch_interval_ms': HOMEASSISTANT_BATCH_INTERVAL * 1000,
             'fade_duration_ms': FADE_DURATION_MS,
             'max_workers': (
                 lifx_client.executor_max_workers
@@ -3060,7 +3528,7 @@ def auto_discover_configured_lights():
     """Automatically discover configured lights by their saved IP addresses"""
     global lifx_client, light_mappings
     
-    if not light_mappings and not nanoleaf_auth:
+    if not light_mappings and not nanoleaf_auth and not _homeassistant_configured():
         return
     
     # Initialize LIFX client if needed
@@ -3074,6 +3542,19 @@ def auto_discover_configured_lights():
     nl_client = None
     if any(_mapping_vendor(lid, mapping) == 'nanoleaf' for lid, mapping in light_mappings.items()) or nanoleaf_auth:
         nl_client = _ensure_nanoleaf_client()
+    ha_client = None
+    if _homeassistant_configured() or any(
+        _mapping_vendor(lid, mapping) == 'homeassistant' for lid, mapping in light_mappings.items()
+    ):
+        ha_client = _ensure_homeassistant_client()
+        if ha_client is not None and ha_client.configured:
+            try:
+                print('Refreshing Home Assistant light entities...')
+                ha_client.discover()
+                _hydrate_homeassistant_devices()
+                print(f'  [OK] {len(ha_client.get_lights())} Home Assistant light(s)')
+            except HomeAssistantError as exc:
+                print(f'  [ERROR] Home Assistant refresh failed: {exc}')
     
     print(f"Auto-discovering {len(light_mappings)} configured light(s)...")
     
@@ -3084,6 +3565,16 @@ def auto_discover_configured_lights():
             continue
         try:
             print(f"  Probing {saved_ip} ({mapping.get('label', mapped_id[:8])})...")
+            if _mapping_vendor(mapped_id, mapping) == 'homeassistant':
+                if ha_client is None:
+                    print("    [ERROR] Home Assistant client unavailable")
+                    continue
+                found = ha_client.get_light(mapped_id)
+                if found is not None:
+                    print(f"    [OK] Found: {found.label} ({found.entity_id})")
+                else:
+                    print(f"    [ERROR] Entity not in last Home Assistant discovery")
+                continue
             if _mapping_vendor(mapped_id, mapping) == 'nanoleaf':
                 if nl_client is None:
                     print("    [ERROR] Nanoleaf client unavailable")
@@ -3128,7 +3619,7 @@ class _ErrorOnlyRequestHandler(WSGIRequestHandler):
 if __name__ == '__main__':
     load_config()
     
-    print(f"sACN2HomeLX v{VERSION} Server starting (LIFX + Nanoleaf)...")
+    print(f"sACN2HomeLX v{VERSION} Server starting (LIFX + Nanoleaf + Home Assistant)...")
     
     # Auto-discover configured lights on startup
     auto_discover_configured_lights()
