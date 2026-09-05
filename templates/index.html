@@ -365,6 +365,11 @@
             color: var(--cyan);
         }
 
+        .chip-vendor.is-homeassistant {
+            background: rgba(24, 188, 242, 0.14);
+            color: #41bdf5;
+        }
+
         .pair-box {
             margin-top: 12px;
             padding: 12px;
@@ -935,9 +940,26 @@
                     </div>
                 </details>
 
+                <details class="fold" id="homeAssistantFold">
+                    <summary>Home Assistant</summary>
+                    <p class="field-hint" style="margin-bottom: 12px;">Connect to a Home Assistant instance to discover and control <code>light.*</code> entities over the REST API. Create a long-lived access token under your HA profile.</p>
+                    <div class="net-grid">
+                        <label class="field">
+                            <span class="field-label">URL</span>
+                            <input type="url" id="haUrlInput" placeholder="https://homeassistant.local:8123" autocomplete="off">
+                        </label>
+                        <label class="field">
+                            <span class="field-label">Long-lived access token</span>
+                            <input type="password" id="haTokenInput" placeholder="Leave blank to keep existing" autocomplete="off">
+                            <span class="field-hint" id="haTokenHint">No token saved yet</span>
+                        </label>
+                        <button class="btn btn-primary" type="button" onclick="saveHomeAssistant()">Save &amp; test</button>
+                    </div>
+                </details>
+
                 <details class="fold">
                     <summary>Add by IP</summary>
-                    <p class="field-hint" style="margin-bottom: 12px;">Use this when a LIFX or Nanoleaf device does not show up in discovery. Nanoleaf still needs pairing after it is added.</p>
+                    <p class="field-hint" style="margin-bottom: 12px;">Use this when a LIFX or Nanoleaf device does not show up in discovery. Nanoleaf still needs pairing after it is added. Home Assistant lights come from Discover after you save the URL and token above.</p>
                     <div class="net-grid">
                         <label class="field">
                             <span class="field-label">IP address</span>
@@ -1000,11 +1022,23 @@
         }
 
         function vendorLabel(light) {
-            return light.vendor === 'nanoleaf' ? 'Nanoleaf' : 'LIFX';
+            if (light.vendor === 'nanoleaf') return 'Nanoleaf';
+            if (light.vendor === 'homeassistant') return 'Home Assistant';
+            return 'LIFX';
+        }
+
+        function vendorChipClass(light) {
+            if (light.vendor === 'nanoleaf') return ' is-nanoleaf';
+            if (light.vendor === 'homeassistant') return ' is-homeassistant';
+            return '';
         }
 
         function lightMetaHtml(light) {
             const vendor = vendorLabel(light);
+            if (light.vendor === 'homeassistant') {
+                const entity = light.entity_id || (String(light.id || '').startsWith('ha_') ? String(light.id).slice(3) : light.id);
+                return `${esc(entity)} · ${esc(light.model)} · ${esc(vendor)}`;
+            }
             return `${esc(light.ip)} · ${esc(light.model)} · ${esc(vendor)}`;
         }
 
@@ -1095,7 +1129,13 @@
 
                 if (data.success) {
                     lights = data.lights;
-                    showNotification(`Discovered ${lights.length} light(s)`);
+                    let msg = `Discovered ${lights.length} light(s)`;
+                    if (data.homeassistant_error) {
+                        msg += ` (Home Assistant: ${data.homeassistant_error})`;
+                        showNotification(msg, true);
+                    } else {
+                        showNotification(msg);
+                    }
                     loadLights();
                 } else {
                     showNotification('Discovery failed: ' + data.error, true);
@@ -1981,7 +2021,7 @@
                     const outOfUniverse = endCh > 512;
                     const id = escJs(light.id);
                     const vendor = vendorLabel(light);
-                    const vendorClass = light.vendor === 'nanoleaf' ? ' is-nanoleaf' : '';
+                    const vendorClass = vendorChipClass(light);
                     return `
                         <article class="light-row ${rowClass}">
                             <div class="light-top">
@@ -2048,7 +2088,7 @@
                 const hasMapped = allConfiguredLights.length > 0;
                 discoveredContainer.innerHTML = hasMapped
                     ? '<div class="empty">All discovered lights are mapped.</div>'
-                    : '<div class="empty"><p>Nothing waiting to be patched.</p><p class="empty-hint">Discover LIFX and Nanoleaf devices, or add one by IP.</p></div>';
+                    : '<div class="empty"><p>Nothing waiting to be patched.</p><p class="empty-hint">Discover LIFX, Nanoleaf, or Home Assistant lights, or add a LIFX/Nanoleaf by IP.</p></div>';
             } else {
                 discoveredContainer.innerHTML = '<div class="light-list">' + unconfiguredLights.map(light => {
                     const id = escJs(light.id);
@@ -3004,9 +3044,63 @@
 
                     if (data.lifx_interface) lifxSelect.value = data.lifx_interface;
                     if (data.sacn_interface) sacnSelect.value = data.sacn_interface;
+                    applyHomeAssistantSettings(data.homeassistant);
                 }
             } catch (error) {
                 console.error('Error loading interfaces:', error);
+            }
+        }
+
+        function applyHomeAssistantSettings(ha) {
+            const urlInput = document.getElementById('haUrlInput');
+            const hint = document.getElementById('haTokenHint');
+            if (!urlInput || !hint) return;
+            if (ha && ha.url) urlInput.value = ha.url;
+            if (ha && ha.token_configured) {
+                hint.textContent = ha.token_masked
+                    ? `Token saved (${ha.token_masked})`
+                    : 'Token saved';
+            } else {
+                hint.textContent = 'No token saved yet';
+            }
+            const fold = document.getElementById('homeAssistantFold');
+            if (fold && ha && ha.configured) fold.open = true;
+        }
+
+        async function saveHomeAssistant() {
+            const urlInput = document.getElementById('haUrlInput');
+            const tokenInput = document.getElementById('haTokenInput');
+            if (!urlInput) return;
+            const url = (urlInput.value || '').trim();
+            const token = (tokenInput && tokenInput.value) ? tokenInput.value.trim() : '';
+            if (!url) {
+                showNotification('Home Assistant URL is required', true);
+                return;
+            }
+            try {
+                const body = { url, test: true };
+                if (token) body.token = token;
+                const response = await fetch('/api/settings/homeassistant', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const data = await validateJsonResponse(response);
+                if (!data.success) {
+                    showNotification('Failed to save Home Assistant settings: ' + data.error, true);
+                    return;
+                }
+                applyHomeAssistantSettings(data.homeassistant);
+                if (tokenInput) tokenInput.value = '';
+                if (data.test_error) {
+                    showNotification('Saved, but connection test failed: ' + data.test_error, true);
+                } else if (data.tested) {
+                    showNotification('Home Assistant connected');
+                } else {
+                    showNotification('Home Assistant settings saved');
+                }
+            } catch (error) {
+                showNotification('Error: ' + error.message, true);
             }
         }
 
