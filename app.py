@@ -116,8 +116,8 @@ light_mappings: Dict[str, Dict] = {}  # light_id -> {universe, start_channel, br
 nanoleaf_auth: Dict[str, Dict] = {}  # runtime: config + env/secrets overlay
 _nanoleaf_auth_config: Dict[str, Dict] = {}  # persisted to config.json only
 # Home Assistant connection: config file values, overlaid by env at runtime.
-_homeassistant_config: Dict[str, str] = {'url': '', 'token': ''}
-homeassistant_settings: Dict[str, str] = {'url': '', 'token': ''}
+_homeassistant_config: Dict[str, object] = {'url': '', 'token': '', 'allow_http': False}
+homeassistant_settings: Dict[str, object] = {'url': '', 'token': '', 'allow_http': False}
 _config_save_blocked = False  # True after a parse failure; do not overwrite config.json
 running = False
 dmx_thread: Optional[threading.Thread] = None
@@ -517,6 +517,7 @@ def save_config():
                 'homeassistant': {
                     'url': _homeassistant_config.get('url', ''),
                     'token': _homeassistant_config.get('token', ''),
+                    'allow_http': bool(_homeassistant_config.get('allow_http')),
                 },
             }
         }, indent=2)
@@ -639,20 +640,33 @@ def _store_nanoleaf_auth(device: NanoleafDevice) -> None:
     _persist_nanoleaf_auth(device.id, device.auth_token, device.ip, device.port)
 
 
-def _sanitize_homeassistant_settings(raw) -> Dict[str, str]:
+def _sanitize_homeassistant_settings(raw) -> Dict[str, object]:
     if not isinstance(raw, dict):
-        return {'url': '', 'token': ''}
+        return {'url': '', 'token': '', 'allow_http': False}
     url = raw.get('url') or ''
     token = raw.get('token') or ''
     url_str = str(url).strip() if url is not None else ''
     token_str = str(token).strip() if token is not None else ''
+    allow_raw = raw.get('allow_http', False)
+    if isinstance(allow_raw, str):
+        allow_http = allow_raw.strip().lower() in ('1', 'true', 'yes')
+    else:
+        allow_http = bool(allow_raw)
     if url_str:
         try:
-            url_str = normalize_base_url(url_str)
+            url_str = normalize_base_url(url_str, allow_http=allow_http)
         except HomeAssistantError:
             # Keep the raw string so the UI can show it; configure() validates later.
             pass
-    return {'url': url_str, 'token': token_str}
+    return {'url': url_str, 'token': token_str, 'allow_http': allow_http}
+
+
+def _ha_allow_http_enabled(settings: Optional[Dict] = None) -> bool:
+    source = settings if settings is not None else homeassistant_settings
+    value = source.get('allow_http', False)
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes')
+    return bool(value)
 
 
 def _refresh_homeassistant_runtime_settings() -> None:
@@ -661,17 +675,33 @@ def _refresh_homeassistant_runtime_settings() -> None:
     merged = {
         'url': _homeassistant_config.get('url', ''),
         'token': _homeassistant_config.get('token', ''),
+        'allow_http': bool(_homeassistant_config.get('allow_http')),
     }
-    merged.update(load_settings_from_env())
+    env = load_settings_from_env()
+    if env.get('url'):
+        merged['url'] = env['url']
+    if env.get('token'):
+        merged['token'] = env['token']
+    if env.get('allow_http'):
+        merged['allow_http'] = True
+    allow_http = _ha_allow_http_enabled(merged)
+    url = str(merged.get('url') or '').strip()
+    if url:
+        try:
+            url = normalize_base_url(url, allow_http=allow_http)
+        except HomeAssistantError:
+            pass
     homeassistant_settings = {
-        'url': str(merged.get('url') or '').strip(),
+        'url': url,
         'token': str(merged.get('token') or '').strip(),
+        'allow_http': allow_http,
     }
     if homeassistant_client is not None:
         try:
             homeassistant_client.configure(
                 homeassistant_settings.get('url', ''),
                 homeassistant_settings.get('token', ''),
+                allow_http=allow_http,
             )
         except HomeAssistantError as exc:
             print(f'Warning: Invalid Home Assistant settings: {exc}')
@@ -695,11 +725,13 @@ def _ensure_homeassistant_client() -> Optional[HomeAssistantClient]:
     _refresh_homeassistant_runtime_settings()
     if not _homeassistant_configured():
         return homeassistant_client
+    allow_http = _ha_allow_http_enabled()
     if homeassistant_client is None:
         try:
             homeassistant_client = HomeAssistantClient(
                 homeassistant_settings.get('url', ''),
                 homeassistant_settings.get('token', ''),
+                allow_http=allow_http,
             )
         except HomeAssistantError as exc:
             print(f'Warning: Could not create Home Assistant client: {exc}')
@@ -709,6 +741,7 @@ def _ensure_homeassistant_client() -> Optional[HomeAssistantClient]:
             homeassistant_client.configure(
                 homeassistant_settings.get('url', ''),
                 homeassistant_settings.get('token', ''),
+                allow_http=allow_http,
             )
         except HomeAssistantError as exc:
             print(f'Warning: Invalid Home Assistant settings: {exc}')
@@ -1469,6 +1502,15 @@ _nl_perf_metrics = {
     'peak_drain_duration_s': 0.0,
     'drain_overrun_count': 0,
 }
+_ha_perf_metrics = {
+    'total_commands_sent': 0,
+    'total_batches_sent': 0,
+    'avg_batch_size': 0.0,
+    'batch_sizes': deque(maxlen=50),
+    'last_drain_duration_s': 0.0,
+    'peak_drain_duration_s': 0.0,
+    'drain_overrun_count': 0,
+}
 
 
 def _rolling_per_second(events: deque, now: float, counted: bool = False) -> float:
@@ -1806,7 +1848,7 @@ def _ha_send_batch_item(item) -> None:
 
 def _ha_send_one_batch():
     """Drain pending Home Assistant commands if the send interval has elapsed."""
-    global _ha_batch_commands_by_id, _ha_last_batch_time
+    global _ha_batch_commands_by_id, _ha_last_batch_time, _ha_perf_metrics
 
     if not homeassistant_client:
         return
@@ -1824,6 +1866,7 @@ def _ha_send_one_batch():
     if not batch:
         return
 
+    drain_start = time.time()
     workers = min(HA_BATCH_WORKERS, len(batch))
     futures = None
     with _ha_batch_sender_start_lock:
@@ -1838,6 +1881,20 @@ def _ha_send_one_batch():
             future.result()
 
     _ha_last_batch_time = current_time
+    drain_duration = time.time() - drain_start
+    with _perf_lock:
+        _ha_perf_metrics['total_batches_sent'] += 1
+        _ha_perf_metrics['total_commands_sent'] += len(batch)
+        _ha_perf_metrics['batch_sizes'].append(len(batch))
+        if len(_ha_perf_metrics['batch_sizes']) > 0:
+            _ha_perf_metrics['avg_batch_size'] = (
+                sum(_ha_perf_metrics['batch_sizes']) / len(_ha_perf_metrics['batch_sizes'])
+            )
+        _ha_perf_metrics['last_drain_duration_s'] = drain_duration
+        if drain_duration > _ha_perf_metrics['peak_drain_duration_s']:
+            _ha_perf_metrics['peak_drain_duration_s'] = drain_duration
+        if drain_duration > HOMEASSISTANT_BATCH_INTERVAL:
+            _ha_perf_metrics['drain_overrun_count'] += 1
 
 
 def _ha_batch_sender_worker(stop_event: threading.Event):
@@ -2318,14 +2375,16 @@ def _interfaces_payload():
 
 def _homeassistant_public_settings() -> Dict[str, object]:
     """Settings safe to return to the UI (token masked)."""
-    url = homeassistant_settings.get('url') or ''
-    token = homeassistant_settings.get('token') or ''
+    url = str(homeassistant_settings.get('url') or '')
+    token = str(homeassistant_settings.get('token') or '')
+    allow_http = _ha_allow_http_enabled()
     return {
         'url': url,
         'token_configured': bool(token),
         'token_masked': ('*' * 8 + token[-4:]) if len(token) > 4 else ('********' if token else ''),
         'configured': _homeassistant_configured(),
-        'host': host_from_url(url) if url else '',
+        'host': host_from_url(url, allow_http=allow_http) if url else '',
+        'allow_http': allow_http,
     }
 
 
@@ -2436,9 +2495,12 @@ def set_homeassistant_settings():
         current['token'] = str(token).strip()
     elif token is not None and str(token).strip() == '' and data.get('clear_token'):
         current['token'] = ''
+    if 'allow_http' in data:
+        current['allow_http'] = bool(data.get('allow_http'))
+    allow_http = _ha_allow_http_enabled(current)
     try:
         if current.get('url'):
-            current['url'] = normalize_base_url(current['url'])
+            current['url'] = normalize_base_url(str(current['url']), allow_http=allow_http)
     except HomeAssistantError as exc:
         return jsonify({'success': False, 'error': str(exc)}), 400
     _merge_homeassistant_settings(current)
@@ -3506,6 +3568,10 @@ def get_metrics():
         nl_metrics['batch_sizes'] = list(_nl_perf_metrics['batch_sizes'])
         nl_metrics['batch_interval_ms'] = NANOLEAF_BATCH_INTERVAL * 1000
         metrics['nanoleaf'] = nl_metrics
+        ha_metrics = dict(_ha_perf_metrics)
+        ha_metrics['batch_sizes'] = list(_ha_perf_metrics['batch_sizes'])
+        ha_metrics['batch_interval_ms'] = HOMEASSISTANT_BATCH_INTERVAL * 1000
+        metrics['homeassistant'] = ha_metrics
     
     return jsonify({
         'success': True,

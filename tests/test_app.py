@@ -479,8 +479,8 @@ class TestListLightsApi(unittest.TestCase):
         app.homeassistant_client = None
         app.nanoleaf_auth = {}
         app._nanoleaf_auth_config = {}
-        app._homeassistant_config = {'url': '', 'token': ''}
-        app.homeassistant_settings = {'url': '', 'token': ''}
+        app._homeassistant_config = {'url': '', 'token': '', 'allow_http': False}
+        app.homeassistant_settings = {'url': '', 'token': '', 'allow_http': False}
         app._dmx_mapping_cache_dirty = True
         self._schedule_patch = patch.object(app, '_schedule_nanoleaf_hydrate')
         self._schedule_patch.start()
@@ -643,8 +643,9 @@ class TestListLightsApi(unittest.TestCase):
         mock_ha.configured = True
         app.homeassistant_client = mock_ha
         app.homeassistant_settings = {
-            'url': 'http://ha.local:8123',
+            'url': 'https://ha.local:8123',
             'token': 'secret',
+            'allow_http': False,
         }
         app._homeassistant_config = dict(app.homeassistant_settings)
         app.lifx_client = None
@@ -664,13 +665,20 @@ class TestListLightsApi(unittest.TestCase):
 
     def test_homeassistant_settings_masks_token(self):
         app._homeassistant_config = {
-            'url': 'http://ha.local:8123',
+            'url': 'https://ha.local:8123',
             'token': 'abcdefghijklmnop',
+            'allow_http': False,
         }
-        app._refresh_homeassistant_runtime_settings()
-        resp = self.client.get('/api/settings/homeassistant')
+        with patch.dict(os.environ, {
+            'HOMEASSISTANT_URL': '',
+            'HOMEASSISTANT_TOKEN': '',
+            'HOMEASSISTANT_ALLOW_HTTP': '',
+        }):
+            app._refresh_homeassistant_runtime_settings()
+            resp = self.client.get('/api/settings/homeassistant')
         data = resp.get_json()
         self.assertTrue(data['success'])
+        self.assertEqual(data['homeassistant']['url'], 'https://ha.local:8123')
         self.assertTrue(data['homeassistant']['token_configured'])
         self.assertNotIn('abcdefghijklmnop', data['homeassistant']['token_masked'])
         self.assertTrue(data['homeassistant']['token_masked'].endswith('mnop'))

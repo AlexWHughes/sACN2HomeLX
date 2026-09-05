@@ -28,14 +28,24 @@ class TestHomeAssistantIds(unittest.TestCase):
 
     def test_normalize_base_url(self):
         self.assertEqual(
-            normalize_base_url('http://homeassistant.local:8123/'),
-            'http://homeassistant.local:8123',
+            normalize_base_url('https://homeassistant.local:8123/'),
+            'https://homeassistant.local:8123',
         )
         with self.assertRaises(HomeAssistantError):
             normalize_base_url('homeassistant.local:8123')
+        with self.assertRaises(HomeAssistantError):
+            normalize_base_url('http://homeassistant.local:8123')
+        self.assertEqual(
+            normalize_base_url('http://homeassistant.local:8123/', allow_http=True),
+            'http://homeassistant.local:8123',
+        )
 
     def test_host_from_url(self):
-        self.assertEqual(host_from_url('http://192.168.1.50:8123'), '192.168.1.50:8123')
+        self.assertEqual(host_from_url('https://192.168.1.50:8123'), '192.168.1.50:8123')
+        self.assertEqual(
+            host_from_url('http://192.168.1.50:8123', allow_http=True),
+            '192.168.1.50:8123',
+        )
 
 
 class TestLightFromState(unittest.TestCase):
@@ -89,13 +99,13 @@ class _FakeResponse:
 
 class TestHomeAssistantClient(unittest.TestCase):
     def test_configured_requires_url_and_token(self):
-        client = HomeAssistantClient('http://ha.local:8123', 'token')
+        client = HomeAssistantClient('http://ha.local:8123', 'token', allow_http=True)
         self.assertTrue(client.configured)
         client.configure('', 'token')
         self.assertFalse(client.configured)
 
     def test_discover_filters_lights(self):
-        client = HomeAssistantClient('http://ha.local:8123', 'secret')
+        client = HomeAssistantClient('http://ha.local:8123', 'secret', allow_http=True)
         states = [
             {
                 'entity_id': 'light.a',
@@ -115,7 +125,7 @@ class TestHomeAssistantClient(unittest.TestCase):
         self.assertEqual(client.get_light('ha_light.a').label, 'A')
 
     def test_send_color_rgb_turn_on(self):
-        client = HomeAssistantClient('http://ha.local:8123', 'secret')
+        client = HomeAssistantClient('http://ha.local:8123', 'secret', allow_http=True)
         light = HomeAssistantLight(
             'light.desk',
             label='Desk',
@@ -140,7 +150,7 @@ class TestHomeAssistantClient(unittest.TestCase):
         self.assertEqual(captured['body']['transition'], 0.1)
 
     def test_send_color_off_uses_turn_off(self):
-        client = HomeAssistantClient('http://ha.local:8123', 'secret')
+        client = HomeAssistantClient('http://ha.local:8123', 'secret', allow_http=True)
         light = HomeAssistantLight('light.desk', supported_color_modes=['rgb'])
         captured = {}
 
@@ -155,7 +165,7 @@ class TestHomeAssistantClient(unittest.TestCase):
         self.assertEqual(captured['body']['entity_id'], 'light.desk')
 
     def test_http_error_raises(self):
-        client = HomeAssistantClient('http://ha.local:8123', 'secret')
+        client = HomeAssistantClient('http://ha.local:8123', 'secret', allow_http=True)
 
         def boom(request, timeout=None):
             raise HTTPError(
@@ -168,7 +178,7 @@ class TestHomeAssistantClient(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 401)
 
     def test_url_error_raises(self):
-        client = HomeAssistantClient('http://ha.local:8123', 'secret')
+        client = HomeAssistantClient('http://ha.local:8123', 'secret', allow_http=True)
         with patch(
             'homeassistant_client.urllib.request.urlopen',
             side_effect=URLError('down'),
@@ -177,7 +187,7 @@ class TestHomeAssistantClient(unittest.TestCase):
                 client.discover()
 
     def test_apply_saved_hydrates_offline_light(self):
-        client = HomeAssistantClient('http://ha.local:8123', 'secret')
+        client = HomeAssistantClient('http://ha.local:8123', 'secret', allow_http=True)
         client.apply_saved({
             'ha_light.office': {
                 'entity_id': 'light.office',

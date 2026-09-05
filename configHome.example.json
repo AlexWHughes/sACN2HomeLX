@@ -67,8 +67,9 @@
       }
     },
     "homeassistant": {
-      "url": "http://homeassistant.local:8123",
-      "token": "YOUR_HOME_ASSISTANT_LONG_LIVED_TOKEN"
+      "url": "https://homeassistant.local:8123",
+      "token": "YOUR_HOME_ASSISTANT_LONG_LIVED_TOKEN",
+      "allow_http": false
     }
   }
 }

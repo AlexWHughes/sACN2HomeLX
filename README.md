@@ -140,11 +140,11 @@ sACN2HomeLX can drive any `light.*` entity exposed by a Home Assistant instance 
 ### Setup
 
 1. In Home Assistant, open your user profile and create a **Long-Lived Access Token**.
-2. In the sACN2HomeLX UI, open **Home Assistant**, enter the instance URL (for example `http://homeassistant.local:8123` or `http://192.168.1.50:8123`), paste the token, and click **Save & test**.
+2. In the sACN2HomeLX UI, open **Home Assistant**, enter the instance URL (for example `https://homeassistant.local:8123` or `https://ha.example.com`), paste the token, and click **Save & test**. Plain HTTP is rejected by default; for a local HTTP-only instance set `"allow_http": true` in `settings.homeassistant` or export `HOMEASSISTANT_ALLOW_HTTP=1`.
 3. Click **Discover**. HA lights appear alongside LIFX and Nanoleaf with a Home Assistant vendor chip.
 4. Map each entity to a universe and start channel as usual, then press **GO**.
 
-Settings are stored in `config.json` under `settings.homeassistant` (`url`, `token`). You can also set `HOMEASSISTANT_URL` and `HOMEASSISTANT_TOKEN` in the environment; env values override the file at runtime. Treat the token like a password — `config.json` is written mode `0600`, and the UI only shows a masked form.
+Settings are stored in `config.json` under `settings.homeassistant` (`url`, `token`, optional `allow_http`). You can also set `HOMEASSISTANT_URL` and `HOMEASSISTANT_TOKEN` in the environment; env values override the file at runtime. Treat the token like a password — `config.json` is written mode `0600`, and the UI only shows a masked form.
 
 ### Control behaviour
 

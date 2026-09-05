@@ -160,23 +160,34 @@ def entity_id_from_ha_id(light_id: str) -> str:
     return cleaned
 
 
-def normalize_base_url(url: str) -> str:
-    """Strip trailing slash and require an http(s) scheme."""
+def normalize_base_url(url: str, *, allow_http: bool = False) -> str:
+    """Strip trailing slash and require HTTPS (HTTP only with explicit opt-in)."""
     cleaned = (url or '').strip().rstrip('/')
     if not cleaned:
         return ''
     parsed = urlparse(cleaned)
-    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+    if parsed.scheme == 'http':
+        if not allow_http:
+            raise HomeAssistantError(
+                'Home Assistant URL must use HTTPS '
+                '(pass allow_http=True or set HOMEASSISTANT_ALLOW_HTTP=1 for local HTTP)'
+            )
+        if not parsed.netloc:
+            raise HomeAssistantError(
+                'Home Assistant URL must be an absolute http(s) URL '
+                '(e.g. http://homeassistant.local:8123)'
+            )
+    elif parsed.scheme != 'https' or not parsed.netloc:
         raise HomeAssistantError(
-            'Home Assistant URL must be an absolute http(s) URL '
-            '(e.g. http://homeassistant.local:8123)'
+            'Home Assistant URL must be an absolute https URL '
+            '(e.g. https://homeassistant.local:8123)'
         )
     return cleaned
 
 
-def host_from_url(url: str) -> str:
+def host_from_url(url: str, *, allow_http: bool = False) -> str:
     try:
-        cleaned = normalize_base_url(url)
+        cleaned = normalize_base_url(url, allow_http=allow_http)
     except HomeAssistantError:
         return ''
     return urlparse(cleaned).netloc or ''
@@ -253,13 +264,15 @@ class HomeAssistantClient:
         base_url: str = '',
         token: str = '',
         timeout: float = DEFAULT_HTTP_TIMEOUT,
+        allow_http: bool = False,
     ):
         self._lock = threading.Lock()
         self.lights: Dict[str, HomeAssistantLight] = {}
         self.timeout = float(timeout)
         self._base_url = ''
         self._token = ''
-        self.configure(base_url, token)
+        self._allow_http = bool(allow_http)
+        self.configure(base_url, token, allow_http=self._allow_http)
 
     @property
     def configured(self) -> bool:
@@ -274,14 +287,25 @@ class HomeAssistantClient:
         return bool(self._token)
 
     @property
-    def ha_host(self) -> str:
-        return host_from_url(self._base_url)
+    def allow_http(self) -> bool:
+        return self._allow_http
 
-    def configure(self, base_url: str = '', token: str = '') -> None:
+    @property
+    def ha_host(self) -> str:
+        return host_from_url(self._base_url, allow_http=self._allow_http)
+
+    def configure(
+        self,
+        base_url: str = '',
+        token: str = '',
+        allow_http: Optional[bool] = None,
+    ) -> None:
         url = (base_url or '').strip()
         tok = (token or '').strip()
+        if allow_http is not None:
+            self._allow_http = bool(allow_http)
         if url:
-            self._base_url = normalize_base_url(url)
+            self._base_url = normalize_base_url(url, allow_http=self._allow_http)
         else:
             self._base_url = ''
         self._token = tok
@@ -352,6 +376,10 @@ class HomeAssistantClient:
     def _headers(self) -> Dict[str, str]:
         if not self._token:
             raise HomeAssistantError('Home Assistant access token is not configured')
+        if self._base_url.startswith('http://') and not self._allow_http:
+            raise HomeAssistantError(
+                'Plain HTTP is disabled; use HTTPS or enable allow_http / HOMEASSISTANT_ALLOW_HTTP'
+            )
         return {
             'Authorization': f'Bearer {self._token}',
             'Content-Type': 'application/json',
@@ -502,4 +530,7 @@ def load_settings_from_env() -> Dict[str, str]:
         out['url'] = url
     if token:
         out['token'] = token
+    allow = (os.getenv('HOMEASSISTANT_ALLOW_HTTP') or '').strip().lower()
+    if allow in ('1', 'true', 'yes'):
+        out['allow_http'] = '1'
     return out
